@@ -10256,20 +10256,21 @@ static bool metal_graph_encode_decode_layer(
 
     /* Phase 2 turbo3 read path: the layer raw_cache is byte-packed (431 B/row
      * vs 2048 B/row for fp8) so existing attention kernels can't dereference
-     * it as `float *raw_kv`.  Dequant the whole window into the per-graph
-     * scratch float tensor and substitute it as `raw_cache` for the rest of
-     * this function.  Two scratches exist — one for the main layer caches and
-     * one for the MTP raw cache — picked by pointer identity below. */
-    ds4_gpu_tensor *raw_cache_attn = raw_cache;
-    if (ok) {
-        ds4_gpu_tensor *dequant_scratch = (raw_cache == g->mtp_raw_cache)
-                ? g->mtp_raw_cache_dequant_scratch
-                : g->raw_cache_dequant_scratch;
-        raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
-                raw_cache, dequant_scratch,
-                raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
-        if (!raw_cache_attn) ok = false;
-    }
+     * it as `float *raw_kv`.
+     *
+     * Phase 2b: kernels with inline-dequant siblings (currently the
+     * decode_heads simple path via attention_decode_mixed_turbo3_kernel)
+     * read packed bytes directly — no view_dispatch hop needed.
+     * Kernels without an inline-dequant sibling yet (indexed_mixed)
+     * still go through view_dispatch which dequants into the per-graph
+     * scratch float tensor.
+     *
+     * We defer the view_dispatch call to the attention branch below
+     * where we know which kernel runs.  raw_cache (packed bytes in
+     * turbo3, float in fp8) is passed into the branch unmodified. */
+    ds4_gpu_tensor *dequant_scratch = (raw_cache == g->mtp_raw_cache)
+            ? g->mtp_raw_cache_dequant_scratch
+            : g->raw_cache_dequant_scratch;
 
     uint32_t n_comp = 0;
     ds4_gpu_tensor *comp_cache = NULL;
@@ -10568,7 +10569,13 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
-            ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            /* Indexed mixed path: kernel still needs float input, so
+             * dequant to scratch.  Wave 2 will migrate this kernel. */
+            ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
+                    raw_cache, dequant_scratch,
+                    raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
+            if (!raw_cache_attn) ok = false;
+            if (ok) ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
                     model->size,
@@ -10597,11 +10604,50 @@ static bool metal_graph_encode_decode_layer(
                                                                 n_comp,
                                                                 &decode_index_stage_t0);
             }
+        } else if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+            /* Phase 2b Wave 1.2: decode_heads has an inline-dequant
+             * turbo3 sibling — pass packed bytes directly, no
+             * view_dispatch dequant. */
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+            int rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
+                    g->heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->q, raw_cache, row_bytes, n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp ? comp_cache : NULL,
+                    metal_graph_attn_comp_cache_is_f16(),
+                    n_comp,
+                    NULL,
+                    0,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+            if (rc == 0) {
+                /* Turbo3 launcher rejected — fall back via dequant + float kernel. */
+                ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
+                        raw_cache, dequant_scratch,
+                        raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (!raw_cache_attn) ok = false;
+                if (ok) ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
+                                                                     model->map, model->size,
+                                                                     layer->attn_sinks->abs_offset,
+                                                                     g->q, raw_cache_attn, n_raw,
+                                                                     raw_cap,
+                                                                     raw_start,
+                                                                     n_comp ? comp_cache : NULL,
+                                                                     metal_graph_attn_comp_cache_is_f16(),
+                                                                     n_comp,
+                                                                     NULL,
+                                                                     0,
+                                                                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+            }
         } else {
+            /* fp8 path: raw_cache is already float, no view_dispatch needed
+             * (view_dispatch is a no-op in fp8 mode). */
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,
                                                          layer->attn_sinks->abs_offset,
-                                                         g->q, raw_cache_attn, n_raw,
+                                                         g->q, raw_cache, n_raw,
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,

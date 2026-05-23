@@ -3063,6 +3063,17 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
 }
 
+// Unaligned f32 load: turbo3 rows are 431 bytes (not 4-aligned), so
+// the RoPE tail at byte offset 175 in each row can't be dereferenced
+// as `float *`.  memcpy compiles to byte-wise loads which work at any
+// alignment.  Compiler optimizes to a uint32 load when alignment is
+// known at compile time.
+__device__ __forceinline__ float turbo3_load_unaligned_f32(const unsigned char *p) {
+    float f;
+    memcpy(&f, p, sizeof(float));
+    return f;
+}
+
 // Phase 2b Wave 1.1: inline-dequant turbo3 sibling of
 // attention_prefill_raw_kernel.  Reads packed turbo3 bytes from
 // raw_kv_bytes directly instead of going through the
@@ -3125,9 +3136,9 @@ __global__ static void attention_prefill_raw_turbo3_kernel(
                 dot += qh[g * 64 + i] * group[i];
             }
         }
-        const float *rope_tail = (const float *)(kv_bytes + data_bytes + scale_bytes);
+        const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
         for (uint32_t d = 0; d < n_rot; d++) {
-            dot += qh[n_nope + d] * rope_tail[d];
+            dot += qh[n_nope + d] * turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
         }
         scores[r] = dot * scale;
         local_max = fmaxf(local_max, scores[r]);
@@ -3167,9 +3178,9 @@ __global__ static void attention_prefill_raw_turbo3_kernel(
         // RoPE tail: 64 threads in window [n_groups, n_groups+n_rot)
         // copy one float each.  Below the V-acc fan-out, so safe.
         if (threadIdx.x >= n_groups && threadIdx.x < n_groups + n_rot) {
-            const float *rope_tail = (const float *)(kv_bytes + data_bytes + scale_bytes);
+            const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
             uint32_t d = threadIdx.x - n_groups;
-            kv_scratch[n_nope + d] = rope_tail[d];
+            kv_scratch[n_nope + d] = turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
         }
         __syncthreads();
         float s = scores[r];
@@ -3489,6 +3500,233 @@ __global__ static void attention_unpack_group_low_kernel(
     uint32_t g = q / n_tokens;
     uint32_t low_dim = n_groups * rank;
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
+}
+
+// Phase 2b Wave 1.2: inline-dequant turbo3 sibling of
+// attention_decode_mixed_kernel for the simple per-row path
+// (n_tokens == 1 || visible_comp == 0).  Reads packed turbo3 bytes
+// from raw_kv_bytes directly; the comp_kv path stays float because
+// the compressed cache is not turbo3-quantized.
+//
+// This is the actual hot-path inline dequant — decode-token
+// generation always lands here for n_tokens=1 + turbo3 + view_dispatch
+// callers.  Eliminates one full-cap dequant-to-scratch hop per layer
+// per token, which is the source of the Phase 2a -13% gen_tps
+// regression.
+//
+// The 8-lane warp-shuffle path is NOT implemented here — host
+// dispatcher falls back to attention_decode_mixed_kernel + the
+// existing dequant-to-scratch when use_comp_mask + n_tokens>1.
+//
+// Metal portability: same pure-scalar template as
+// attention_prefill_raw_turbo3_kernel — see that kernel's preamble.
+__global__ static void attention_decode_mixed_turbo3_kernel(
+        float               *heads,
+        const float         *sinks,
+        const float         *q,
+        const unsigned char *raw_kv_bytes,
+        uint64_t             row_bytes,
+        const float         *comp_kv,
+        const float         *comp_mask,
+        uint32_t             use_comp_mask,
+        uint32_t             n_tokens,
+        uint32_t             pos0,
+        uint32_t             n_raw,
+        uint32_t             raw_cap,
+        uint32_t             raw_start,
+        uint32_t             n_comp,
+        uint32_t             window,
+        uint32_t             ratio,
+        uint32_t             n_head,
+        uint32_t             head_dim,
+        uint32_t             n_rot,
+        int                  signs_on) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const uint64_t scale_bytes = (uint64_t)n_groups;
+    const bool single_all = (n_tokens == 1u && ratio == 0u);
+    uint32_t qpos = pos0 + t;
+    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ float kv_scratch[512];
+    float scale = rsqrtf((float)head_dim);
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (single_all) {
+                raw_count = n_raw > 256u ? 256u : n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    __syncthreads();
+    uint32_t n_score = raw_count + visible_comp;
+    float local_max = sinks[h];
+
+    // K-dot: per-thread per-row, inline turbo3 dequant.
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+        float dot = 0.0f;
+        float group[64];
+        for (uint32_t g = 0; g < n_groups; g++) {
+            turbo3_dequant_group64_device(group, kv_bytes, g, n_nope, signs_on);
+            #pragma unroll
+            for (uint32_t i = 0; i < 64; i++) {
+                dot += qh[g * 64 + i] * group[i];
+            }
+        }
+        const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+        for (uint32_t d = 0; d < n_rot; d++) {
+            dot += qh[n_nope + d] * turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+        }
+        scores[r] = dot * scale;
+        local_max = fmaxf(local_max, scores[r]);
+    }
+    // comp_kv path: unchanged, float input.
+    for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
+        float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
+        float s = -INFINITY;
+        if (add > -1.0e20f) {
+            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            s = dot * scale + add;
+        }
+        scores[raw_count + c] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    // Softmax reduction (identical to fp8 path).
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+
+    // V-acc: cooperative shmem dequant per row.  Fast path mirrors the
+    // (head_dim=512, blockDim=256) fp8 specialization with 2 d's per
+    // thread.  Generic path handles other shapes with up to 8 d's per
+    // thread (head_dim=512 / blockDim>=64).
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        uint32_t d0 = threadIdx.x;
+        uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+            if (threadIdx.x < n_groups) {
+                float buf[64];
+                turbo3_dequant_group64_device(buf, kv_bytes, threadIdx.x, n_nope, signs_on);
+                float *gd = kv_scratch + (uint64_t)threadIdx.x * TURBO3_GROUP_SIZE;
+                #pragma unroll
+                for (uint32_t i = 0; i < 64; i++) gd[i] = buf[i];
+            }
+            if (threadIdx.x >= n_groups && threadIdx.x < n_groups + n_rot) {
+                const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                uint32_t d = threadIdx.x - n_groups;
+                kv_scratch[n_nope + d] = turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+            }
+            __syncthreads();
+            float s = scores[r];
+            acc0 += kv_scratch[d0] * s;
+            acc1 += kv_scratch[d1] * s;
+            __syncthreads();
+        }
+        for (uint32_t c = 0; c < visible_comp; c++) {
+            float s = scores[raw_count + c];
+            const float *kv = comp_kv + (uint64_t)c * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        float acc_d[8];
+        #pragma unroll
+        for (uint32_t i = 0; i < 8; i++) acc_d[i] = 0.0f;
+        const uint32_t ds_per_thread = (head_dim + blockDim.x - 1u) / blockDim.x;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+            if (threadIdx.x < n_groups) {
+                float buf[64];
+                turbo3_dequant_group64_device(buf, kv_bytes, threadIdx.x, n_nope, signs_on);
+                float *gd = kv_scratch + (uint64_t)threadIdx.x * TURBO3_GROUP_SIZE;
+                #pragma unroll
+                for (uint32_t i = 0; i < 64; i++) gd[i] = buf[i];
+            }
+            if (threadIdx.x >= n_groups && threadIdx.x < n_groups + n_rot) {
+                const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                uint32_t d = threadIdx.x - n_groups;
+                kv_scratch[n_nope + d] = turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+            }
+            __syncthreads();
+            float s = scores[r];
+            for (uint32_t i = 0; i < ds_per_thread; i++) {
+                uint32_t d = i * blockDim.x + threadIdx.x;
+                if (d < head_dim) acc_d[i] += kv_scratch[d] * s;
+            }
+            __syncthreads();
+        }
+        for (uint32_t c = 0; c < visible_comp; c++) {
+            float s = scores[raw_count + c];
+            const float *kv = comp_kv + (uint64_t)c * head_dim;
+            for (uint32_t i = 0; i < ds_per_thread; i++) {
+                uint32_t d = i * blockDim.x + threadIdx.x;
+                if (d < head_dim) acc_d[i] += kv[d] * s;
+            }
+        }
+        for (uint32_t i = 0; i < ds_per_thread; i++) {
+            uint32_t d = i * blockDim.x + threadIdx.x;
+            if (d < head_dim) oh[d] = acc_d[i] / denom;
+        }
+    }
 }
 
 __global__ static void attention_decode_mixed_kernel(
@@ -7566,6 +7804,67 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
+
+/* Phase 2b Wave 1.2 entry point: turbo3-packed sibling of
+ * ds4_gpu_attention_decode_heads_tensor.  Reads the packed turbo3
+ * raw cache directly via attention_decode_mixed_turbo3_kernel —
+ * skips the dequant-to-scratch hop on the decode-token call site
+ * (metal_graph_decode_layer).  Falls back via return-0 when
+ * conditions aren't met (caller should retry the float path). */
+extern "C" int ds4_gpu_attention_decode_heads_turbo3_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_mask,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (comp_kv_f16 ||
+        !heads || !q || !raw_kv_bytes || !model_map || n_raw == 0 || raw_cap < n_raw ||
+        raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
+        n_rot > head_dim ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
+        raw_kv_bytes->bytes < (uint64_t)raw_cap * row_bytes ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
+        return 0;
+    }
+    /* Score buffer fit + simple-path predicate.  Decode-token always
+     * runs simple (n_tokens=1).  Window/online fall-back left to the
+     * caller for now (will land in Wave 2). */
+    if (!cuda_attention_score_buffer_fits(n_comp)) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(1, n_head, 1);
+    attention_decode_mixed_turbo3_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const unsigned char *)raw_kv_bytes->ptr,
+            row_bytes,
+            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv_bytes->ptr,
+            use_mask ? (const float *)comp_mask->ptr : NULL,
+            use_mask,
+            1, 0, n_raw, raw_cap, raw_start, n_comp,
+            0, 0, n_head, head_dim, n_rot,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "attention decode_turbo3 launch");
+}
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
@@ -7848,6 +8147,81 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
+}
+
+/* Phase 2b Wave 1.2 entry point: turbo3-packed sibling of
+ * ds4_gpu_attention_decode_{raw,mixed}_batch_heads_tensor.
+ *
+ * Reads the packed turbo3 raw cache directly via the inline-dequant
+ * kernel (attention_decode_mixed_turbo3_kernel) — skips the
+ * dequant-to-scratch hop for the simple (n_tokens=1) decode-token
+ * case, which is the bandwidth source of the Phase 2a -13% gen_tps
+ * regression.
+ *
+ * Eligibility check (caller side): turbo3 mode AND n_tokens=1.  In
+ * fp8 mode or for n_tokens>1 prefill chunks, callers should keep
+ * using the float-input launchers.  This entry point does NOT cover
+ * the 8-lane warp path or the _online window-attention path —
+ * Wave 2 follow-up adds those. */
+extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (comp_kv_f16 ||
+        !heads || !q || !raw_kv_bytes || !model_map || n_tokens == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
+        n_rot > head_dim ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv_bytes->bytes < (uint64_t)raw_cap * row_bytes ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
+        return 0;
+    }
+    if (n_comp != 0 && ratio == 0) return 0;
+    /* Caller-only-decode contract: this entry serves the simple
+     * per-row K-dot path (n_tokens=1).  For n_tokens>1 fall back to
+     * the float path. */
+    if (n_tokens != 1u) return 0;
+    if (!cuda_attention_score_buffer_fits(n_comp)) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(n_tokens, n_head, 1);
+    attention_decode_mixed_turbo3_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const unsigned char *)raw_kv_bytes->ptr,
+            row_bytes,
+            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv_bytes->ptr,
+            use_comp_mask ? (const float *)comp_mask->ptr : NULL,
+            use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
+            raw_start, n_comp, window, ratio, n_head, head_dim, n_rot,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "attention_decode_mixed_turbo3 launch");
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
