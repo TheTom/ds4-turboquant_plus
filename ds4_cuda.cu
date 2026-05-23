@@ -5078,7 +5078,10 @@ __global__ static void attention_decode_mixed_heads8_online_turbo3_kernel(
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
     __shared__ uint32_t raw_first_idx_s;
-    __shared__ float4 kv_shared[4 * 128];
+    // TILE_M=16 (vs fp8's 4): 4x fewer __syncthreads + 4x better dequant
+    // thread utilization (16*7=112 of 256 threads vs 4*7=28).  Tile shmem
+    // 16*128 float4 = 32KB; total CTA shmem ~34KB, within the 48KB cap.
+    __shared__ float4 kv_shared[16 * 128];
 
     const uint32_t qpos = pos0 + t;
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -5140,7 +5143,7 @@ __global__ static void attention_decode_mixed_heads8_online_turbo3_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    constexpr uint32_t TILE_M = 4u;
+    constexpr uint32_t TILE_M = 16u;
     for (uint32_t row0 = 0; row0 < n_score; row0 += TILE_M) {
         const uint32_t nr = n_score - row0 < TILE_M ? n_score - row0 : TILE_M;
 
@@ -9157,7 +9160,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
             topk_ptr = sorted;
         }
         dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-        attention_indexed_mixed_heads8_online_turbo3_kernel<8, 16><<<grid, 512>>>(
+        // ROWS_PER_STAGE=16 (vs fp8's 8): doubles dequant-phase thread utilization
+        // (16*7=112 tasks across 512 threads = 22% vs 11%).  Tile shmem still
+        // fits the default 48KB CTA cap (16*512*4 = 32KB).
+        attention_indexed_mixed_heads8_online_turbo3_kernel<16, 16><<<grid, 512>>>(
                 (float *)heads->ptr,
                 sinks,
                 (const float *)q->ptr,
