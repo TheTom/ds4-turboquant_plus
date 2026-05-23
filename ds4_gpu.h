@@ -269,6 +269,18 @@ int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Phase 2 packed-byte pack kernel.  Reads a [n_tok, head_dim] float tensor
+ * (the post-RoPE KV projection output) and writes the turbo3 packed bytes
+ * into `dst` at `n_tok * dst_row_bytes` total bytes.  `dst_row_bytes` must
+ * equal `ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3)`. */
+int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_tok,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              dst_row_bytes);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,

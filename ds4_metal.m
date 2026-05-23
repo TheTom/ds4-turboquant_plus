@@ -6490,6 +6490,18 @@ int ds4_gpu_kv_turbo3_store_raw_tensor(
     return 0;
 }
 
+int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_tok,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              dst_row_bytes) {
+    (void)src; (void)dst; (void)n_tok; (void)head_dim; (void)n_rot; (void)dst_row_bytes;
+    fprintf(stderr, "ds4: --kv-cache turbo3 (packed) is CUDA-only in this build; Metal port deferred\n");
+    return 0;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,

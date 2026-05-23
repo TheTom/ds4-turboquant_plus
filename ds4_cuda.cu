@@ -2682,6 +2682,231 @@ __global__ static void turbo3_kv_quantize_kernel(float *x, uint32_t n_tok, uint3
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2: packed turbo3 cache storage + inline dequant for attention V-load.
+//
+// Layout per cache row (head_dim=512, n_rot=64, GROUP_SIZE=64):
+//   bytes  0..167  : packed 3-bit indices  (n_nope * 3/8 = 168 bytes)
+//                    inside each group of 64 elements: 8 sub-chunks of 3 bytes,
+//                    each holding 8 indices via the canonical pattern
+//                    b0 = i0|(i1<<3)|(i2<<6), b1 = (i2>>2)|(i3<<1)|(i4<<4)|(i5<<7),
+//                    b2 = (i5>>1)|(i6<<2)|(i7<<5).
+//   bytes 168..174 : 7 FP8 E4M3 matched-norm scales, one per 64-element group.
+//   bytes 175..430 : 64 raw little-endian floats (RoPE tail).
+//   total            431 bytes per row vs 2048 bytes for fp8 float-sim (4.75x).
+//
+// Stored values are in the ORIGINAL basis (the pack kernel applies the inverse
+// rotation conceptually by storing centroid*scale and letting the read side
+// run a per-group iWHT-with-signs).  Every existing reader sees floats from
+// the same per-element distribution it would have read in the fp8 float-sim
+// path, modulo the FP8 group scale's ~12% precision.
+//
+// Reference: ds4_phase2_atlas_patterns.md (Section 2 dequant primitive, Section
+// 3 BC=4 batched pattern).  Atlas's turbo3 uses GROUP_SIZE=16 for finer scale
+// granularity; ds4 stays on the Phase-1 GROUP_SIZE=64 cadence so the matched-
+// norm scale arithmetic and `--logprob-vectors` regression remain valid.
+
+// Forward declaration: defined in the host-emitted constant tables below.
+#define TURBO3_GROUP_SIZE 64
+#define TURBO3_SUBCHUNKS_PER_GROUP 8   // 64 elems / 8 per sub-chunk
+#define TURBO3_DATA_BYTES_PER_GROUP 24  // 8 sub-chunks * 3 bytes
+
+// Forward turbo3 group write — runs ONE thread (caller passes its own scratch).
+// `rotated[64]` holds the post-WHT, post-signs2 floats.  Writes 24 data bytes +
+// 1 FP8 scale byte to `data_out` / `scale_out`.
+__device__ __forceinline__ void turbo3_pack_group64_device(
+        unsigned char *data_out,
+        unsigned char *scale_out,
+        const float   *rotated) {
+    float amax = 0.0f, norm_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        const float v = rotated[i];
+        const float av = fabsf(v);
+        if (av > amax) amax = av;
+        norm_sq += v * v;
+    }
+    const float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX_D / amax) : 1.0f;
+
+    unsigned int idx[64];
+    float recon_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        idx[i] = turbo3_quant_idx(rotated[i] * k_inv);
+        const float c = DS4_TURBO3_CODEBOOK_D[idx[i]];
+        recon_sq += c * c;
+    }
+    const float recon_norm = sqrtf(recon_sq);
+    float scale = (recon_norm > 1e-10f) ? (sqrtf(norm_sq) / recon_norm)
+                                        : (amax / DS4_TURBO3_MAX_D);
+    if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+
+    // FP8 E4M3 encode.  Use the CUDA-runtime portable cvt helper rather than
+    // the sm_89+ `cvt.rn.satfinite.e4m3x2.f32` PTX directly so the build
+    // works at the default cuda-spark arch.  Match `dsv4_e4m3fn_dequant_dev`
+    // semantics: non-negative input (matched_scale is always >=0) saturated
+    // to E4M3 max=448.
+    float scale_clamped = scale;
+    if (scale_clamped > 448.0f) scale_clamped = 448.0f;
+    if (scale_clamped < 0.0f) scale_clamped = 0.0f;
+    const __nv_fp8_storage_t s = __nv_cvt_float_to_fp8(
+            scale_clamped, __NV_SATFINITE, __NV_E4M3);
+    *scale_out = (unsigned char)s;
+
+    // Pack 64 indices into 24 bytes: 8 sub-chunks of 3 bytes each.
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const unsigned int *p = &idx[chunk * 8];
+        unsigned char *b = &data_out[chunk * 3];
+        b[0] = (unsigned char)((p[0])      | (p[1] << 3) | ((p[2] & 0x3) << 6));
+        b[1] = (unsigned char)((p[2] >> 2) | (p[3] << 1) | (p[4] << 4) | ((p[5] & 0x1) << 7));
+        b[2] = (unsigned char)((p[5] >> 1) | (p[6] << 2) | (p[7] << 5));
+    }
+}
+
+// Inverse rotation in registers — 64-element iWHT-with-signs butterfly.
+// Atlas's wht256_warp_bf16 is the bf16 warp-distributed version; here we run
+// the whole 64-element transform inside one thread because the attention
+// inner loop is already serial on the K-row (one thread reads its assigned
+// element range from the dequanted register buffer).  64 floats fit in
+// registers easily (256 bytes per thread, well under the 64KB/thread limit).
+__device__ __forceinline__ void turbo3_iwht64_inplace_device(float *buf) {
+    #pragma unroll
+    for (uint32_t stride = 1; stride < 64; stride <<= 1) {
+        #pragma unroll
+        for (uint32_t base = 0; base < 64; base += 2u * stride) {
+            #pragma unroll
+            for (uint32_t i = 0; i < stride; i++) {
+                const float a = buf[base + i];
+                const float b = buf[base + stride + i];
+                buf[base + i] = a + b;
+                buf[base + stride + i] = a - b;
+            }
+        }
+    }
+}
+
+// One-shot group dequant: takes a packed cache row pointer, group index,
+// and writes 64 original-basis floats into `out[64]`.  This is the helper
+// every attention kernel inlines per group it touches.
+//
+// `signs_on` is propagated as a uniform per-CTA value (compiler will
+// constant-fold it most of the time).
+//
+// Cost per call (per thread): 24 byte loads + 1 FP8 byte load + 1 cvt + 64
+// LUT lookups + 64 muls + 6-stage 64-element butterfly + signs1 mul = roughly
+// 200 fp32 ops + 256 mem ops.  For comparison the float-sim path is 64 float
+// loads = 64 mem ops + 0 compute.  So we trade ~4x memory traffic for ~200
+// compute ops per group — favorable when the K row is hot in cache, which
+// it isn't on long SWA scans where the trade reverses to ~25x less BW for
+// ~3.5x more compute (see ds4_phase2_atlas_patterns.md §3 for the BC=4
+// amortization analysis).
+__device__ __forceinline__ void turbo3_dequant_group64_device(
+        float               *out64,
+        const unsigned char *row_base,
+        uint32_t             group_idx,
+        uint32_t             n_nope,
+        int                  signs_on) {
+    const unsigned char *data_slot = row_base + (uint64_t)group_idx * TURBO3_DATA_BYTES_PER_GROUP;
+    const unsigned long data_bytes = (unsigned long)n_nope * 3u / 8u;
+    const unsigned char scale_byte = row_base[data_bytes + group_idx];
+
+    // FP8 E4M3 -> f32 via the hardware cvt.  Same primitive used elsewhere
+    // in ds4_cuda.cu for FP8 scale dequant.
+    const float scale = __half2float(__nv_cvt_fp8_to_halfraw(scale_byte, __NV_E4M3));
+
+    // Unpack 24 bytes -> 64 rotated-basis floats * scale.
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const unsigned char *b = data_slot + chunk * 3;
+        float *o = out64 + chunk * 8;
+        const unsigned int b0 = b[0], b1 = b[1], b2 = b[2];
+        o[0] = DS4_TURBO3_CODEBOOK_D[(b0)                  & 0x7] * scale;
+        o[1] = DS4_TURBO3_CODEBOOK_D[(b0 >> 3)             & 0x7] * scale;
+        o[2] = DS4_TURBO3_CODEBOOK_D[((b0 >> 6) | (b1<<2)) & 0x7] * scale;
+        o[3] = DS4_TURBO3_CODEBOOK_D[(b1 >> 1)             & 0x7] * scale;
+        o[4] = DS4_TURBO3_CODEBOOK_D[(b1 >> 4)             & 0x7] * scale;
+        o[5] = DS4_TURBO3_CODEBOOK_D[((b1 >> 7) | (b2<<1)) & 0x7] * scale;
+        o[6] = DS4_TURBO3_CODEBOOK_D[(b2 >> 2)             & 0x7] * scale;
+        o[7] = DS4_TURBO3_CODEBOOK_D[(b2 >> 5)             & 0x7] * scale;
+    }
+
+    // Inverse rotation: signs2 -> WHT -> 1/sqrt(64) -> signs1.
+    if (signs_on) {
+        #pragma unroll
+        for (int i = 0; i < 64; i++) out64[i] *= DS4_TURBO_SIGNS2_64_D[i];
+    }
+    turbo3_iwht64_inplace_device(out64);
+    const float inv_sqrt_n = rsqrtf(64.0f);
+    #pragma unroll
+    for (int i = 0; i < 64; i++) out64[i] *= inv_sqrt_n;
+    if (signs_on) {
+        #pragma unroll
+        for (int i = 0; i < 64; i++) out64[i] *= DS4_TURBO_SIGNS1_64_D[i];
+    }
+}
+
+// Pack kernel: reads a [n_tok, head_dim] float tensor (the post-RoPE KV
+// projection output) and writes [n_tok * ds4_kv_row_bytes(...)] packed bytes.
+// Grid: <<<n_tok, 64>>>.  One thread per group of 64 elements.
+//
+// First 7 threads handle the 7 packed groups (one each).  Remaining 57 threads
+// idle for that phase, then thread 0 copies the RoPE tail (64 floats) into the
+// trailing bytes via a uint4 strided write.
+extern "C" __global__ void turbo3_kv_pack_kernel(
+        const float    * __restrict__ src,
+        unsigned char  * __restrict__ dst,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint64_t          dst_row_bytes,
+        int               signs_on) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_tok) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const float *src_row = src + (uint64_t)row * head_dim;
+    unsigned char *dst_row = dst + (uint64_t)row * dst_row_bytes;
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const float inv_sqrt_n = rsqrtf(64.0f);
+
+    if (tid < n_groups) {
+        // Per-group forward rotation in registers.  64 floats per thread.
+        float buf[64];
+        const float *gs = src_row + (uint64_t)tid * TURBO3_GROUP_SIZE;
+        if (signs_on) {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] = gs[i] * DS4_TURBO_SIGNS1_64_D[i];
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] = gs[i];
+        }
+        // Same WHT-in-registers butterfly used by the iWHT helper above —
+        // butterfly is self-inverse, so the same body runs for forward.
+        turbo3_iwht64_inplace_device(buf);
+        #pragma unroll
+        for (int i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64_D[i];
+        }
+
+        // Pack into data + scale.
+        unsigned char *data_slot = dst_row + (uint64_t)tid * TURBO3_DATA_BYTES_PER_GROUP;
+        unsigned char *scale_slot = dst_row + data_bytes + (uint64_t)tid;
+        turbo3_pack_group64_device(data_slot, scale_slot, buf);
+    }
+
+    // RoPE tail copy — one thread handles 64 floats via 4 strided uint4 writes.
+    // (Float tail starts at offset data_bytes + n_groups.)
+    if (tid == 0 && n_rot > 0) {
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        unsigned char *rope_slot = dst_row + data_bytes + scale_bytes;
+        memcpy(rope_slot, src_row + n_nope, (size_t)n_rot * sizeof(float));
+    }
+}
+
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
@@ -6543,6 +6768,30 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_
     turbo3_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot, ds4_turbo_signs_enabled_dev());
     return cuda_ok(cudaGetLastError(), "turbo3_kv_quantize launch");
 }
+
+/* Phase 2 packed-write entry point.  `src` is the float KV input tensor
+ * ([n_tok, head_dim]); `dst` is the packed-byte cache region ([n_tok *
+ * dst_row_bytes]).  Caller is responsible for having computed dst_row_bytes
+ * via ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3). */
+extern "C" int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_tok,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              dst_row_bytes) {
+    if (!src || !dst || n_rot > head_dim) return 0;
+    if (n_tok == 0) return 1;
+    if (src->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    if (dst->bytes < (uint64_t)n_tok * dst_row_bytes) return 0;
+    turbo3_kv_pack_kernel<<<n_tok, 64>>>(
+            (const float *)src->ptr,
+            (unsigned char *)dst->ptr,
+            n_tok, head_dim, n_rot, dst_row_bytes,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_kv_pack launch");
+}
+
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
