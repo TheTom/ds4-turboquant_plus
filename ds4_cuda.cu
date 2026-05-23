@@ -4828,6 +4828,219 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
+// Phase 2b Wave 2.1: inline-dequant turbo3 sibling of
+// attention_decode_mixed_heads8_online_kernel.  FlashAttention-style
+// online softmax: tile of TILE_M=4 rows cooperatively loaded into
+// kv_shared, then each of 8 warps owns one head's per-row K-dot +
+// V-acc update.
+//
+// Cooperative load phase rewritten to inline-dequant turbo3 packed
+// rows directly into kv_shared.  Comp rows stay on the float4 load
+// path (compressed cache is not turbo3-quantized).
+__global__ static void attention_decode_mixed_heads8_online_turbo3_kernel(
+        float               *heads,
+        const float         *sinks,
+        const float         *q,
+        const unsigned char *raw_kv_bytes,
+        uint64_t             row_bytes,
+        const float         *comp_kv,
+        uint32_t             n_tokens,
+        uint32_t             pos0,
+        uint32_t             n_raw,
+        uint32_t             raw_cap,
+        uint32_t             raw_start,
+        uint32_t             n_comp,
+        uint32_t             window,
+        uint32_t             ratio,
+        uint32_t             n_head,
+        uint32_t             head_dim,
+        uint32_t             n_rot,
+        int                  signs_on) {
+    uint32_t t = blockIdx.x;
+    uint32_t head_group = blockIdx.y;
+    if (t >= n_tokens || head_dim != 512u) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const uint64_t scale_bytes = (uint64_t)n_groups;
+
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t raw_count_s;
+    __shared__ uint32_t raw_first_idx_s;
+    __shared__ float4 kv_shared[4 * 128];
+
+    const uint32_t qpos = pos0 + t;
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t comp_count = 0;
+    if (n_comp != 0u) {
+        if (n_tokens == 1u && ratio == 0u) {
+            comp_count = n_comp;
+        } else if (ratio != 0u) {
+            comp_count = (qpos + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
+    }
+    if (threadIdx.x == 0) {
+        uint32_t raw_count = 0;
+        uint32_t raw_first_idx = 0;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+        raw_count_s = raw_count;
+        raw_first_idx_s = raw_first_idx;
+    }
+    __syncthreads();
+    const uint32_t raw_count = raw_count_s;
+    const uint32_t raw_first_idx = raw_first_idx_s;
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    __syncthreads();
+
+    const uint32_t n_score = raw_count + comp_count;
+    const float scale = rsqrtf((float)head_dim);
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+        : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    constexpr uint32_t TILE_M = 4u;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += TILE_M) {
+        const uint32_t nr = n_score - row0 < TILE_M ? n_score - row0 : TILE_M;
+
+        // Cooperative populate of nr rows into kv_shared.
+        // Phase A: raw rows, group dequants (nr*n_groups tasks, up to 28).
+        const uint32_t total_groups = nr * n_groups;
+        if (threadIdx.x < total_groups) {
+            uint32_t r_in_tile = threadIdx.x / n_groups;
+            uint32_t g         = threadIdx.x % n_groups;
+            uint32_t sr        = row0 + r_in_tile;
+            if (sr < raw_count) {
+                const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[sr] * row_bytes;
+                float buf[64];
+                turbo3_dequant_group64_device(buf, kv_bytes, g, n_nope, signs_on);
+                float *dst = ((float *)(kv_shared + r_in_tile * 128u)) + g * TURBO3_GROUP_SIZE;
+                #pragma unroll
+                for (uint32_t i = 0; i < 64; i++) dst[i] = buf[i];
+            }
+        }
+        // Phase B: raw rows, RoPE tail (nr*n_rot floats, up to 256).
+        const uint32_t total_rope = nr * n_rot;
+        for (uint32_t idx = threadIdx.x; idx < total_rope; idx += blockDim.x) {
+            uint32_t r_in_tile = idx / n_rot;
+            uint32_t d         = idx % n_rot;
+            uint32_t sr        = row0 + r_in_tile;
+            if (sr < raw_count) {
+                const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[sr] * row_bytes;
+                const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                ((float *)(kv_shared + r_in_tile * 128u))[n_nope + d] =
+                        turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+            }
+        }
+        // Phase C: comp rows, float4 stride load for sr >= raw_count.
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            if (sr >= raw_count && sr < n_score) {
+                const float4 *src = (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
+                kv_shared[off] = src[c4];
+            }
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                float4 k0 = kv4[lane +  0u];
+                float4 k1 = kv4[lane + 32u];
+                float4 k2 = kv4[lane + 64u];
+                float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) +
+                              dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) +
+                              dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(0xffffffffu, score, 0);
+
+                const float new_m = fmaxf(max_s, score);
+                const float old_scale = expf(max_s - new_m);
+                const float row_scale = expf(score - new_m);
+                sum_s = sum_s * old_scale + row_scale;
+                o0.x = o0.x * old_scale + k0.x * row_scale;
+                o0.y = o0.y * old_scale + k0.y * row_scale;
+                o0.z = o0.z * old_scale + k0.z * row_scale;
+                o0.w = o0.w * old_scale + k0.w * row_scale;
+                o1.x = o1.x * old_scale + k1.x * row_scale;
+                o1.y = o1.y * old_scale + k1.y * row_scale;
+                o1.z = o1.z * old_scale + k1.z * row_scale;
+                o1.w = o1.w * old_scale + k1.w * row_scale;
+                o2.x = o2.x * old_scale + k2.x * row_scale;
+                o2.y = o2.y * old_scale + k2.y * row_scale;
+                o2.z = o2.z * old_scale + k2.z * row_scale;
+                o2.w = o2.w * old_scale + k2.w * row_scale;
+                o3.x = o3.x * old_scale + k3.x * row_scale;
+                o3.y = o3.y * old_scale + k3.y * row_scale;
+                o3.z = o3.z * old_scale + k3.z * row_scale;
+                o3.w = o3.w * old_scale + k3.w * row_scale;
+                max_s = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        const float sink = sinks[head];
+        const float new_m = fmaxf(max_s, sink);
+        const float old_scale = expf(max_s - new_m);
+        const float sink_scale = expf(sink - new_m);
+        sum_s = sum_s * old_scale + sink_scale;
+        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
+        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
+        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
+        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
+
+        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
+    }
+}
+
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
@@ -8513,16 +8726,36 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
-    /* Caller-only-decode contract: this entry serves the simple
-     * per-row K-dot path (n_tokens=1).  For n_tokens>1 fall back to
-     * the float path. */
-    if (n_tokens != 1u) return 0;
-    /* Turbo3 kernel scores[2048] cap; fall back on overflow. */
-    if (n_comp + 256u > 2048u) return 0;
-    if (!cuda_attention_score_buffer_fits(n_comp)) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+
+    /* Wave 2.1: n_tokens > 1 (prefill chunk) or use_comp_mask routes
+     * through the heads8_online turbo3 kernel.  Falls back via return
+     * 0 if the window-mask shape isn't supported.  Note the online
+     * kernel doesn't take comp_mask — caller should fall through to
+     * the float path when use_comp_mask is set. */
+    if (use_comp_mask) return 0;
+    if (n_tokens > 1u || !cuda_attention_score_buffer_fits(n_comp) ||
+        getenv("DS4_CUDA_FORCE_TURBO3_ONLINE") != NULL) {
+        if (head_dim != 512u) return 0;
+        dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
+        attention_decode_mixed_heads8_online_turbo3_kernel<<<online_grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const unsigned char *)raw_kv_bytes->ptr,
+                row_bytes,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv_bytes->ptr,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                window, ratio, n_head, head_dim, n_rot,
+                ds4_turbo_signs_enabled_dev());
+        return cuda_ok(cudaGetLastError(), "attention_decode_mixed_heads8_online_turbo3 launch");
+    }
+
+    /* Wave 1.2: n_tokens=1 simple-path decode-token. */
+    /* Turbo3 kernel scores[2048] cap; fall back on overflow. */
+    if (n_comp + 256u > 2048u) return 0;
     dim3 grid(n_tokens, n_head, 1);
     attention_decode_mixed_turbo3_kernel<<<grid, 256>>>(
             (float *)heads->ptr,

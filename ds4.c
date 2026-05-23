@@ -12495,25 +12495,51 @@ static bool metal_graph_encode_layer_attention_batch(
                                           il,
                                           pos0);
         }
-        ds4_gpu_tensor *raw_cache_attn = ok ? ds4_gpu_kv_attention_view_dispatch(
-                g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
-                g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT) : NULL;
-        if (ok && !raw_cache_attn) ok = false;
-        if (ok) {
-            ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
-                                                                   model->map,
-                                                                   model->size,
-                                                                   layer->attn_sinks->abs_offset,
-                                                                   g->batch_q,
-                                                                   raw_cache_attn,
-                                                                   n_tokens,
-                                                                   pos0,
-                                                                   n_raw,
-                                                                   g->raw_cap,
-                                                                   raw_start,
-                                                                   g->raw_window,
-                                                                   DS4_N_HEAD,
-                                                                   DS4_N_HEAD_DIM) != 0;
+        /* Phase 2b Wave 2.1: prefill-chunk raw batch.  Try turbo3
+         * heads8_online via the turbo3 launcher first; fall back to
+         * float dequant-to-scratch + existing kernel on rc==0. */
+        int turbo3_rc = 0;
+        if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+            turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
+                    g->batch_heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q,
+                    g->layer_raw_cache[il], row_bytes,
+                    /* comp_kv  */ NULL,
+                    /* comp_kv_f16 */ 0,
+                    /* comp_mask */ NULL,
+                    /* use_comp_mask */ 0,
+                    n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                    /* n_comp */ 0,
+                    g->raw_window,
+                    /* ratio */ 0,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+        }
+        if (turbo3_rc == 0) {
+            ds4_gpu_tensor *raw_cache_attn = ok ? ((g_ds4_kv_dtype == DS4_KV_TURBO3)
+                    ? ds4_gpu_kv_attention_view_dispatch(
+                            g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
+                            g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
+                    : g->layer_raw_cache[il]) : NULL;
+            if (ok && !raw_cache_attn) ok = false;
+            if (ok) {
+                ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
+                                                                       model->map,
+                                                                       model->size,
+                                                                       layer->attn_sinks->abs_offset,
+                                                                       g->batch_q,
+                                                                       raw_cache_attn,
+                                                                       n_tokens,
+                                                                       pos0,
+                                                                       n_raw,
+                                                                       g->raw_cap,
+                                                                       raw_start,
+                                                                       g->raw_window,
+                                                                       DS4_N_HEAD,
+                                                                       DS4_N_HEAD_DIM) != 0;
+            }
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
