@@ -6502,6 +6502,32 @@ int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
     return 0;
 }
 
+int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes) {
+    (void)src; (void)dst; (void)n_rows; (void)head_dim; (void)n_rot; (void)src_row_bytes;
+    fprintf(stderr, "ds4: --kv-cache turbo3 (packed) is CUDA-only in this build; Metal port deferred\n");
+    return 0;
+}
+
+int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes) {
+    (void)src; (void)raw; (void)raw_cap; (void)pos0; (void)n_tokens; (void)head_dim; (void)n_rot; (void)row_bytes;
+    fprintf(stderr, "ds4: --kv-cache turbo3 (packed) is CUDA-only in this build; Metal port deferred\n");
+    return 0;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,

@@ -2815,20 +2815,29 @@ __device__ __forceinline__ void turbo3_dequant_group64_device(
     // in ds4_cuda.cu for FP8 scale dequant.
     const float scale = __half2float(__nv_cvt_fp8_to_halfraw(scale_byte, __NV_E4M3));
 
-    // Unpack 24 bytes -> 64 rotated-basis floats * scale.
+    // Pre-scaled centroid cache.  Hoists `centroid[c] * scale` out of the
+    // per-element loop so we do 8 multiplies once per group instead of 64
+    // multiplies per group.  Pattern from
+    // /tmp/ds4_phase2_llamacpp_patterns.md §2.3 (TheTom/llama-cpp-turboquant
+    // fattn-vec.cuh:478–512 "Per-block scaled-centroid cache").
+    float sc[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) sc[c] = DS4_TURBO3_CODEBOOK_D[c] * scale;
+
+    // Unpack 24 bytes -> 64 rotated-basis floats via the pre-scaled LUT.
     #pragma unroll
     for (int chunk = 0; chunk < 8; chunk++) {
         const unsigned char *b = data_slot + chunk * 3;
         float *o = out64 + chunk * 8;
         const unsigned int b0 = b[0], b1 = b[1], b2 = b[2];
-        o[0] = DS4_TURBO3_CODEBOOK_D[(b0)                  & 0x7] * scale;
-        o[1] = DS4_TURBO3_CODEBOOK_D[(b0 >> 3)             & 0x7] * scale;
-        o[2] = DS4_TURBO3_CODEBOOK_D[((b0 >> 6) | (b1<<2)) & 0x7] * scale;
-        o[3] = DS4_TURBO3_CODEBOOK_D[(b1 >> 1)             & 0x7] * scale;
-        o[4] = DS4_TURBO3_CODEBOOK_D[(b1 >> 4)             & 0x7] * scale;
-        o[5] = DS4_TURBO3_CODEBOOK_D[((b1 >> 7) | (b2<<1)) & 0x7] * scale;
-        o[6] = DS4_TURBO3_CODEBOOK_D[(b2 >> 2)             & 0x7] * scale;
-        o[7] = DS4_TURBO3_CODEBOOK_D[(b2 >> 5)             & 0x7] * scale;
+        o[0] = sc[(b0)                  & 0x7];
+        o[1] = sc[(b0 >> 3)             & 0x7];
+        o[2] = sc[((b0 >> 6) | (b1<<2)) & 0x7];
+        o[3] = sc[(b1 >> 1)             & 0x7];
+        o[4] = sc[(b1 >> 4)             & 0x7];
+        o[5] = sc[((b1 >> 7) | (b2<<1)) & 0x7];
+        o[6] = sc[(b2 >> 2)             & 0x7];
+        o[7] = sc[(b2 >> 5)             & 0x7];
     }
 
     // Inverse rotation: signs2 -> WHT -> 1/sqrt(64) -> signs1.
@@ -2843,6 +2852,101 @@ __device__ __forceinline__ void turbo3_dequant_group64_device(
     if (signs_on) {
         #pragma unroll
         for (int i = 0; i < 64; i++) out64[i] *= DS4_TURBO_SIGNS1_64_D[i];
+    }
+}
+
+// Ring-aware batch pack kernel.  Sibling of store_raw_kv_batch_kernel — same
+// (pos0 + t) % raw_cap ring write semantics, but writes packed turbo3 bytes
+// per row instead of f16-rounded floats.  Grid: <<<n_tokens, 64>>>.
+extern "C" __global__ void turbo3_kv_pack_batch_kernel(
+        const float    * __restrict__ src,
+        unsigned char  * __restrict__ raw,
+        uint32_t          raw_cap,
+        uint32_t          pos0,
+        uint32_t          n_tokens,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint64_t          row_bytes,
+        int               signs_on) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const uint32_t row = (pos0 + t) % raw_cap;
+    const float *src_row = src + (uint64_t)t * head_dim;
+    unsigned char *dst_row = raw + (uint64_t)row * row_bytes;
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const float inv_sqrt_n = rsqrtf(64.0f);
+
+    if (tid < n_groups) {
+        float buf[64];
+        const float *gs = src_row + (uint64_t)tid * TURBO3_GROUP_SIZE;
+        if (signs_on) {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] = gs[i] * DS4_TURBO_SIGNS1_64_D[i];
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] = gs[i];
+        }
+        turbo3_iwht64_inplace_device(buf);
+        #pragma unroll
+        for (int i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            #pragma unroll
+            for (int i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64_D[i];
+        }
+        unsigned char *data_slot = dst_row + (uint64_t)tid * TURBO3_DATA_BYTES_PER_GROUP;
+        unsigned char *scale_slot = dst_row + data_bytes + (uint64_t)tid;
+        turbo3_pack_group64_device(data_slot, scale_slot, buf);
+    }
+
+    if (tid == 0 && n_rot > 0) {
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        unsigned char *rope_slot = dst_row + data_bytes + scale_bytes;
+        memcpy(rope_slot, src_row + n_nope, (size_t)n_rot * sizeof(float));
+    }
+}
+
+// Dequant kernel: reads `n_rows` packed turbo3 rows from `src` (each row is
+// `src_row_bytes` long) and writes original-basis floats into `dst` at the
+// natural `[n_rows, head_dim]` float layout the existing attention kernels
+// expect.  Grid: <<<n_rows, 64>>>.  Thread `tid` in {0..6} handles its group;
+// thread 0 also copies the RoPE tail.
+//
+// Used by the Phase 2 raw-cache decompress-to-scratch pass before each
+// attention dispatch — the existing 12 attention kernels read the scratch
+// unchanged.  See docs/turbo3-roadmap.md for the Phase 2b inline-dequant
+// follow-up that eliminates this intermediate.
+extern "C" __global__ void turbo3_kv_dequant_to_scratch_kernel(
+        const unsigned char * __restrict__ src,
+        float               * __restrict__ dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes,
+        int                   signs_on) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const unsigned char *src_row = src + (uint64_t)row * src_row_bytes;
+    float *dst_row = dst + (uint64_t)row * head_dim;
+
+    if (tid < n_groups) {
+        float buf[64];
+        turbo3_dequant_group64_device(buf, src_row, tid, n_nope, signs_on);
+        float *gd = dst_row + (uint64_t)tid * TURBO3_GROUP_SIZE;
+        #pragma unroll
+        for (int i = 0; i < 64; i++) gd[i] = buf[i];
+    }
+
+    if (tid == 0 && n_rot > 0) {
+        const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        const unsigned char *rope_slot = src_row + data_bytes + scale_bytes;
+        memcpy(dst_row + n_nope, rope_slot, (size_t)n_rot * sizeof(float));
     }
 }
 
@@ -6790,6 +6894,57 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
             n_tok, head_dim, n_rot, dst_row_bytes,
             ds4_turbo_signs_enabled_dev());
     return cuda_ok(cudaGetLastError(), "turbo3_kv_pack launch");
+}
+
+/* Phase 2 ring-aware batched pack entry point.  Mirrors
+ * ds4_gpu_store_raw_kv_batch_tensor but writes packed turbo3 bytes per row.
+ * `raw_cap` is the SWA ring capacity; `pos0` is the logical start; `n_tokens`
+ * rows are packed into ring slots `(pos0 + t) % raw_cap`. */
+extern "C" int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes) {
+    if (!src || !raw || raw_cap == 0 || n_rot > head_dim) return 0;
+    if (n_tokens == 0) return 1;
+    if (src->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+    if (raw->bytes < (uint64_t)raw_cap * row_bytes) return 0;
+    turbo3_kv_pack_batch_kernel<<<n_tokens, 64>>>(
+            (const float *)src->ptr,
+            (unsigned char *)raw->ptr,
+            raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_kv_pack_batch launch");
+}
+
+/* Phase 2 dequant-to-scratch entry point.  Reads `n_rows` packed turbo3 rows
+ * from `src` (each `src_row_bytes` long) and writes original-basis floats
+ * into `dst` at the `[n_rows, head_dim]` float layout the existing attention
+ * kernels expect.  Used to decompress the layer_raw_cache into a per-graph
+ * float scratch tensor before each attention dispatch — the existing 12
+ * attention kernels read the scratch as if it were the old float cache.
+ * Phase 2b would inline this dequant into each attention kernel directly. */
+extern "C" int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes) {
+    if (!src || !dst || n_rot > head_dim) return 0;
+    if (n_rows == 0) return 1;
+    if (src->bytes < (uint64_t)n_rows * src_row_bytes) return 0;
+    if (dst->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+    turbo3_kv_dequant_to_scratch_kernel<<<n_rows, 64>>>(
+            (const unsigned char *)src->ptr,
+            (float *)dst->ptr,
+            n_rows, head_dim, n_rot, src_row_bytes,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_kv_dequant_to_scratch launch");
 }
 
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {

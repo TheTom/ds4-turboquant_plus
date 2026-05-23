@@ -2135,7 +2135,14 @@ static void ds4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_
 #ifndef DS4_NO_GPU
 /* GPU dispatchers — same dtype-based pick, but for the CUDA tensor helpers.
  * Sites in this file call these instead of the raw fp8 wrappers so a single
- * dtype enum decides which kernel runs. */
+ * dtype enum decides which kernel runs.
+ *
+ * Phase 2 turbo3 path: `_quantize_tensor_dispatch` still runs the float-sim
+ * round trip on `x` (kept for sites that mutate the KV tensor in place but
+ * then write it to a NON-raw_cache destination — e.g. the compressor pool).
+ * Sites that store into the per-layer raw_cache go through the new
+ * `_packed_store_raw_tensor` path below which writes packed bytes directly
+ * via the pack kernel. */
 static int ds4_gpu_kv_quantize_tensor_dispatch(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
@@ -2143,13 +2150,55 @@ static int ds4_gpu_kv_quantize_tensor_dispatch(
     }
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
 }
+
+/* Single-row store into the per-layer raw_cache.  fp8 path is unchanged;
+ * turbo3 path writes packed bytes via the ring-aware batch pack kernel with
+ * n_tokens=1 so the underlying cache buffer can be sized smaller. */
 static int ds4_gpu_kv_store_raw_tensor_dispatch(
         ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
         uint32_t raw_cap, uint32_t row, uint32_t head_dim, uint32_t n_rot) {
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
-        return ds4_gpu_kv_turbo3_store_raw_tensor(kv, raw_cache, raw_cap, row, head_dim, n_rot);
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
+        return ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+                kv, raw_cache, raw_cap, row, 1, head_dim, n_rot, row_bytes);
     }
     return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, row, head_dim, n_rot);
+}
+
+/* Batch store into the per-layer raw_cache.  fp8 routes to the existing f16
+ * batch path; turbo3 routes to the ring-aware packed batch pack kernel. */
+static int ds4_gpu_kv_store_raw_batch_tensor_dispatch(
+        ds4_gpu_tensor *raw_cache, ds4_gpu_tensor *src,
+        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+        uint32_t head_dim, uint32_t n_rot) {
+    if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
+        return ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+                src, raw_cache, raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes);
+    }
+    return ds4_gpu_store_raw_kv_batch_tensor(raw_cache, src, raw_cap, pos0, n_tokens, head_dim);
+}
+
+/* Returns the tensor that attention should READ for the raw KV window.
+ *
+ * fp8: returns `raw_cache` as-is (zero overhead).
+ * turbo3 (packed bytes): dequants `raw_cap` rows of `raw_cache` into the
+ * caller-provided `scratch` (raw_cap * head_dim floats) and returns
+ * `scratch`.  Callers that share one scratch across multiple attention
+ * calls in the same layer can amortize the dequant by caching the result
+ * for the layer/pos pair — see `metal_graph_encode_decode_layer` for the
+ * one-shot-per-layer pattern.  Returns NULL if a dequant launch fails. */
+static ds4_gpu_tensor *ds4_gpu_kv_attention_view_dispatch(
+        ds4_gpu_tensor *raw_cache, ds4_gpu_tensor *scratch,
+        uint32_t raw_cap, uint32_t head_dim, uint32_t n_rot) {
+    if (g_ds4_kv_dtype != DS4_KV_TURBO3) return raw_cache;
+    if (!scratch || !raw_cache) return NULL;
+    const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3);
+    if (ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+            raw_cache, scratch, raw_cap, head_dim, n_rot, row_bytes) == 0) {
+        return NULL;
+    }
+    return scratch;
 }
 #endif
 
@@ -8737,6 +8786,25 @@ typedef struct {
     ds4_gpu_tensor *layer_index_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_N_LAYER];
 
+    /* Phase 2 turbo3 dequant scratch.  When the active dtype is DS4_KV_TURBO3
+     * the layer_raw_cache buffers are sized as packed bytes (~431 B/row vs
+     * 2048 B/row for fp8) — the existing attention kernels can't read them
+     * directly.  Before each attention dispatch the per-graph dequant kernel
+     * unpacks raw_cap rows from layer_raw_cache[il] into this scratch tensor,
+     * and the attention kernel reads the scratch as it always did.  For fp8
+     * this stays NULL and the attention kernel reads layer_raw_cache directly.
+     *
+     * Trade-off: real packed cache memory savings on the layer_raw_cache pool
+     * (a ~9.6 MB shrink on the SWA ring at raw_cap=128, DS4_N_LAYER=43); per-
+     * attention-call dequant pass adds ~5 us at decode T=1 (negligible on
+     * GB10).  The bandwidth win from reading packed bytes vs floats does NOT
+     * materialize at the attention V-load layer in this scheme — see
+     * docs/turbo3-roadmap.md "Phase 2b" for the inline-dequant follow-up that
+     * gets the V-load bandwidth win at the cost of ~600 LoC of CUDA kernel
+     * rewrites across 12 attention kernels. */
+    ds4_gpu_tensor *raw_cache_dequant_scratch;
+    ds4_gpu_tensor *mtp_raw_cache_dequant_scratch;
+
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
      * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
@@ -8956,6 +9024,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
+    ds4_gpu_tensor_free(g->mtp_raw_cache_dequant_scratch);
+    ds4_gpu_tensor_free(g->raw_cache_dequant_scratch);
     ds4_gpu_tensor_free(g->mtp_next_hc);
     ds4_gpu_tensor_free(g->mtp_state_hc);
     ds4_gpu_tensor_free(g->mtp_input_hc);
@@ -9432,10 +9502,24 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
+    /* Per-dtype raw cache row size.  fp8 = head_dim*4 = 2048 bytes; turbo3 =
+     * packed = 431 bytes for DS4_N_HEAD_DIM=512, DS4_N_ROT=64.  See
+     * ds4_kv_row_bytes().  Each layer's raw cache is allocated at the dtype-
+     * specific stride; the dequant-to-scratch pass before attention rewrites
+     * the bytes back into the per-graph `raw_cache_dequant_scratch` float
+     * tensor that the existing attention kernels read. */
+    const uint64_t raw_row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
+    if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+        g->raw_cache_dequant_scratch = ds4_gpu_tensor_alloc(
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->mtp_raw_cache_dequant_scratch = enable_mtp
+                ? ds4_gpu_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float))
+                : NULL;
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+                (uint64_t)raw_cap * raw_row_bytes);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -9542,7 +9626,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+                (uint64_t)raw_cap * raw_row_bytes);
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
@@ -10170,6 +10254,23 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
 
+    /* Phase 2 turbo3 read path: the layer raw_cache is byte-packed (431 B/row
+     * vs 2048 B/row for fp8) so existing attention kernels can't dereference
+     * it as `float *raw_kv`.  Dequant the whole window into the per-graph
+     * scratch float tensor and substitute it as `raw_cache` for the rest of
+     * this function.  Two scratches exist — one for the main layer caches and
+     * one for the MTP raw cache — picked by pointer identity below. */
+    ds4_gpu_tensor *raw_cache_attn = raw_cache;
+    if (ok) {
+        ds4_gpu_tensor *dequant_scratch = (raw_cache == g->mtp_raw_cache)
+                ? g->mtp_raw_cache_dequant_scratch
+                : g->raw_cache_dequant_scratch;
+        raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
+                raw_cache, dequant_scratch,
+                raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
+        if (!raw_cache_attn) ok = false;
+    }
+
     uint32_t n_comp = 0;
     ds4_gpu_tensor *comp_cache = NULL;
     ds4_gpu_tensor *comp_selected = NULL;
@@ -10473,7 +10574,7 @@ static bool metal_graph_encode_decode_layer(
                     model->size,
                     layer->attn_sinks->abs_offset,
                     g->q,
-                    raw_cache,
+                    raw_cache_attn,
                     g->layer_attn_comp_cache[il],
                     metal_graph_attn_comp_cache_is_f16(),
                     comp_selected,
@@ -10500,7 +10601,7 @@ static bool metal_graph_encode_decode_layer(
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,
                                                          layer->attn_sinks->abs_offset,
-                                                         g->q, raw_cache, n_raw,
+                                                         g->q, raw_cache_attn, n_raw,
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
@@ -12266,12 +12367,13 @@ static bool metal_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
-    if (ok && zero_prefix) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                                    g->batch_kv,
-                                                                    g->raw_cap,
-                                                                    pos0,
-                                                                    n_tokens,
-                                                                    DS4_N_HEAD_DIM) != 0;
+    if (ok && zero_prefix) ok = ds4_gpu_kv_store_raw_batch_tensor_dispatch(g->layer_raw_cache[il],
+                                                                              g->batch_kv,
+                                                                              g->raw_cap,
+                                                                              pos0,
+                                                                              n_tokens,
+                                                                              DS4_N_HEAD_DIM,
+                                                                              DS4_N_ROT) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
 
@@ -12301,12 +12403,13 @@ static bool metal_graph_encode_layer_attention_batch(
         const uint32_t raw_start = metal_graph_raw_start_for_span(g,
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
-        ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                 g->batch_kv,
-                                                 g->raw_cap,
-                                                 pos0,
-                                                 n_tokens,
-                                                 DS4_N_HEAD_DIM) != 0;
+        ok = ds4_gpu_kv_store_raw_batch_tensor_dispatch(g->layer_raw_cache[il],
+                                                          g->batch_kv,
+                                                          g->raw_cap,
+                                                          pos0,
+                                                          n_tokens,
+                                                          DS4_N_HEAD_DIM,
+                                                          DS4_N_ROT) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
@@ -12314,13 +12417,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                           il,
                                           pos0);
         }
+        ds4_gpu_tensor *raw_cache_attn = ok ? ds4_gpu_kv_attention_view_dispatch(
+                g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
+                g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT) : NULL;
+        if (ok && !raw_cache_attn) ok = false;
         if (ok) {
             ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    model->map,
                                                                    model->size,
                                                                    layer->attn_sinks->abs_offset,
                                                                    g->batch_q,
-                                                                   g->layer_raw_cache[il],
+                                                                   raw_cache_attn,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -12925,12 +13032,13 @@ static bool metal_graph_encode_layer_attention_batch(
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
 
-            ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                     g->batch_kv,
-                                                     g->raw_cap,
-                                                     pos0,
-                                                     n_tokens,
-                                                     DS4_N_HEAD_DIM) != 0;
+            ok = ds4_gpu_kv_store_raw_batch_tensor_dispatch(g->layer_raw_cache[il],
+                                                              g->batch_kv,
+                                                              g->raw_cap,
+                                                              pos0,
+                                                              n_tokens,
+                                                              DS4_N_HEAD_DIM,
+                                                              DS4_N_ROT) != 0;
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
@@ -12994,6 +13102,10 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 use_comp_mask = 1;
             }
+            ds4_gpu_tensor *raw_cache_attn_a = ok ? ds4_gpu_kv_attention_view_dispatch(
+                    g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
+                    g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT) : NULL;
+            if (ok && !raw_cache_attn_a) ok = false;
             if (ok) {
                 if (use_indexed_comp) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
@@ -13001,7 +13113,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               model->size,
                                                                               layer->attn_sinks->abs_offset,
                                                                               g->batch_q,
-                                                                              g->layer_raw_cache[il],
+                                                                              raw_cache_attn_a,
                                                                               g->layer_attn_comp_cache[il],
                                                                               metal_graph_attn_comp_cache_is_f16(),
                                                                               g->comp_selected,
@@ -13030,7 +13142,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              model->size,
                                                                              layer->attn_sinks->abs_offset,
                                                                              g->batch_q,
-                                                                             g->layer_raw_cache[il],
+                                                                             raw_cache_attn_a,
                                                                              g->layer_attn_comp_cache[il],
                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                              use_comp_mask ? g->comp_mask : NULL,
@@ -13109,13 +13221,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       pos0);
                 }
             }
+            ds4_gpu_tensor *raw_cache_attn_b = ok ? ds4_gpu_kv_attention_view_dispatch(
+                    g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
+                    g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT) : NULL;
+            if (ok && !raw_cache_attn_b) ok = false;
             if (ok) {
                 ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                           model->map,
                                                                           model->size,
                                                                           layer->attn_sinks->abs_offset,
                                                                           g->batch_q,
-                                                                          g->layer_raw_cache[il],
+                                                                          raw_cache_attn_b,
                                                                           g->layer_attn_comp_cache[il],
                                                                           metal_graph_attn_comp_cache_is_f16(),
                                                                           g->comp_selected,
@@ -13230,19 +13346,25 @@ static bool metal_graph_encode_layer_attention_batch(
                 ds4_gpu_tensor *heads_view = metal_graph_tensor_row_view(g->batch_heads, t, q_dim);
                 ok = ok && q_view && kv_cache_view && heads_view;
                 if (ok && !zero_prefix) {
-                    ok = ds4_gpu_store_raw_kv_tensor(g->layer_raw_cache[il],
-                                                       kv_cache_view,
-                                                       g->raw_cap,
-                                                       pos % g->raw_cap,
-                                                       DS4_N_HEAD_DIM) != 0;
+                    /* fp8 path: raw f32 copy into the per-row slot.
+                     * turbo3 path: pack into the packed-byte slot.  The
+                     * pack-batch dispatch helper above handles both. */
+                    ok = ds4_gpu_kv_store_raw_batch_tensor_dispatch(
+                            g->layer_raw_cache[il], kv_cache_view,
+                            g->raw_cap, pos % g->raw_cap, 1u,
+                            DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
                 }
+                ds4_gpu_tensor *raw_cache_attn_c = ok ? ds4_gpu_kv_attention_view_dispatch(
+                        g->layer_raw_cache[il], g->raw_cache_dequant_scratch,
+                        g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT) : NULL;
+                if (ok && !raw_cache_attn_c) ok = false;
                 if (ok && comp_mask != NULL && n_selected != 0) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
                                                                               model->map,
                                                                               model->size,
                                                                               layer->attn_sinks->abs_offset,
                                                                               q_view,
-                                                                              g->layer_raw_cache[il],
+                                                                              raw_cache_attn_c,
                                                                               g->layer_attn_comp_cache[il],
                                                                               metal_graph_attn_comp_cache_is_f16(),
                                                                               g->comp_selected,
@@ -13263,7 +13385,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  model->size,
                                                                  layer->attn_sinks->abs_offset,
                                                                  q_view,
-                                                                 g->layer_raw_cache[il],
+                                                                 raw_cache_attn_c,
                                                                  n_raw,
                                                                  g->raw_cap,
                                                                  raw_start,
@@ -17219,11 +17341,31 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Write the raw ring in logical position order.  The file does not care
          * where the rows happened to live physically in the source graph. */
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
+        /* Phase 2 turbo3 disk save (interim): the cache is byte-packed but the
+         * v1 disk format expects DS4_N_HEAD_DIM * sizeof(float) per row, so we
+         * dequant the live window into the per-graph scratch and write floats
+         * to disk.  Slower than streaming raw bytes but keeps v1 files
+         * loadable by any backend.  Checkpoint 5 introduces the v2 format that
+         * writes packed bytes directly. */
+        ds4_gpu_tensor *raw_cache_disk = g->layer_raw_cache[il];
+        const uint64_t raw_row_disk_bytes = (g_ds4_kv_dtype == DS4_KV_TURBO3)
+                ? ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3)
+                : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+        if (g_ds4_kv_dtype == DS4_KV_TURBO3 && g->raw_cache_dequant_scratch) {
+            if (ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+                    raw_cache_disk, g->raw_cache_dequant_scratch,
+                    g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT, raw_row_disk_bytes) == 0) {
+                payload_set_err(err, errlen, "turbo3 dequant to scratch failed on disk save");
+                rc = 1;
+            } else {
+                raw_cache_disk = g->raw_cache_dequant_scratch;
+            }
+        }
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
+                                           raw_cache_disk,
                                            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
                                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                                            buf,
@@ -17554,11 +17696,22 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
         const uint32_t raw_first = saved_tokens - saved_raw_live;
+        /* Phase 2 turbo3 disk load (interim): the file is in v1 float format
+         * but the cache is byte-packed.  Stream floats into the scratch
+         * tensor, then pack-batch from scratch into the cache.  Same
+         * interim-format compromise as the save path; checkpoint 5 adds the
+         * v2 format that streams packed bytes directly. */
+        ds4_gpu_tensor *raw_cache_load = g->layer_raw_cache[il];
+        const bool needs_pack_after = (g_ds4_kv_dtype == DS4_KV_TURBO3 &&
+                                       g->raw_cache_dequant_scratch != NULL);
+        if (needs_pack_after) {
+            raw_cache_load = g->raw_cache_dequant_scratch;
+        }
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
+                                          raw_cache_load,
                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
                                           buf,
@@ -17566,6 +17719,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                           &remaining,
                                           err,
                                           errlen);
+        }
+        if (rc == 0 && needs_pack_after) {
+            /* Pack the whole window from scratch back into the cache.  Pack
+             * is ring-aware so the per-row physical slot is preserved by
+             * setting pos0 = 0 and n_tokens = raw_cap. */
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+            if (ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+                    g->raw_cache_dequant_scratch, g->layer_raw_cache[il],
+                    g->raw_cap, 0u, g->raw_cap,
+                    DS4_N_HEAD_DIM, DS4_N_ROT, row_bytes) == 0) {
+                payload_set_err(err, errlen, "turbo3 pack-batch failed on disk load");
+                rc = 1;
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
