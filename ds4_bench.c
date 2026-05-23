@@ -403,9 +403,39 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+/* Side-by-side KV footprint for fp8 vs turbo3 at the given backend/ctx.
+ * The active dtype is highlighted; the other one is printed for comparison
+ * so users can see the packed-byte savings at a glance. */
+static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_dtype active) {
+    const ds4_kv_footprint fp8 = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_FP8);
+    const ds4_kv_footprint t3  = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_TURBO3);
+    const double mib = 1.0 / (1024.0 * 1024.0);
+    const double raw_ratio = (t3.raw_bytes > 0)
+            ? ((double)fp8.raw_bytes / (double)t3.raw_bytes) : 0.0;
+    /* Print the SWA ring (the only pool that swaps to packed bytes in Phase
+     * 2a) plus the compressed pools (kept float / F16 — see roadmap). */
+    fprintf(stderr,
+            "ds4-bench: KV footprint @ ctx=%d:\n"
+            "  fp8     raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
+            "  turbo3  raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
+            "  raw shrink: %.2fx  (turbo3 saves %.2f MiB on the SWA ring)\n",
+            ctx_size,
+            (double)fp8.raw_bytes * mib,
+            (double)fp8.compressed_bytes * mib,
+            (double)fp8.total_bytes * mib,
+            active == DS4_KV_FP8 ? "  <-- active" : "",
+            (double)t3.raw_bytes * mib,
+            (double)t3.compressed_bytes * mib,
+            (double)t3.total_bytes * mib,
+            active == DS4_KV_TURBO3 ? "  <-- active" : "",
+            raw_ratio,
+            (double)(fp8.raw_bytes - t3.raw_bytes) * mib);
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
     log_context_memory(cfg.backend, cfg.ctx_alloc);
+    log_kv_footprint_compare(cfg.backend, cfg.ctx_alloc, cfg.kv_dtype);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,

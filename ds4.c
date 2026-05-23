@@ -16767,8 +16767,27 @@ struct ds4_session {
  */
 
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
-#define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+/* Session payload format versions:
+ *   v1: original (DSV4 magic + 13 u32 fields), all raw KV rows stored as
+ *       DS4_N_HEAD_DIM * sizeof(float).
+ *   v2: adds one u32 kv_dtype field (DS4_KV_FP8 or DS4_KV_TURBO3).  When the
+ *       saved dtype is DS4_KV_TURBO3, raw KV rows are stored at the packed
+ *       byte stride ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3) instead
+ *       of head_dim*4.  Compressor + indexer state stay as floats either way
+ *       (deferred to Phase 2d -- see docs/turbo3-roadmap.md).
+ *
+ * Backward compat: a v2 reader that sees a v1 file falls back to the v1
+ * header read (13 fields) and assumes kv_dtype = DS4_KV_FP8.  A v1 reader
+ * sees a v2 file as "unsupported session payload version" and refuses to
+ * load — caller can retry with a fresh prompt.
+ *
+ * Cross-dtype reject: v2 reader compares the saved kv_dtype against the
+ * active engine dtype.  Mismatch -> clear error message; user has to either
+ * switch dtypes or discard the cached prefix. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION_V1 UINT32_C(1)
+#define DS4_SESSION_PAYLOAD_U32_FIELDS 14u
+#define DS4_SESSION_PAYLOAD_U32_FIELDS_V1 13u
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -16874,8 +16893,11 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
 static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    /* Phase 2c v2: raw rows are stored at the per-dtype packed byte stride
+     * when dtype=turbo3.  fp8 path stays at head_dim*4 (v1-equivalent). */
+    const uint64_t raw_row_disk_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)raw_live * raw_row_disk_bytes;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
@@ -17300,11 +17322,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 
     ds4_gpu_graph *g = &s->graph;
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
-    /* Header fields:
+    /* Header fields (v2):
      *   0 magic, 1 version, 2 ctx, 3 prefill chunk, 4 raw cap,
      *   5 raw window, 6 compressed cap, 7 token count,
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
-     *   12 live raw rows serialized below.
+     *   12 live raw rows serialized below,
+     *   13 kv_dtype  (NEW in v2: 0=fp8, 1=turbo3)
      */
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
@@ -17320,6 +17343,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
         raw_live,
+        (uint32_t)g_ds4_kv_dtype,
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -17341,33 +17365,18 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Write the raw ring in logical position order.  The file does not care
          * where the rows happened to live physically in the source graph. */
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
-        /* Phase 2 turbo3 disk save (interim): the cache is byte-packed but the
-         * v1 disk format expects DS4_N_HEAD_DIM * sizeof(float) per row, so we
-         * dequant the live window into the per-graph scratch and write floats
-         * to disk.  Slower than streaming raw bytes but keeps v1 files
-         * loadable by any backend.  Checkpoint 5 introduces the v2 format that
-         * writes packed bytes directly. */
-        ds4_gpu_tensor *raw_cache_disk = g->layer_raw_cache[il];
-        const uint64_t raw_row_disk_bytes = (g_ds4_kv_dtype == DS4_KV_TURBO3)
-                ? ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3)
-                : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
-        if (g_ds4_kv_dtype == DS4_KV_TURBO3 && g->raw_cache_dequant_scratch) {
-            if (ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
-                    raw_cache_disk, g->raw_cache_dequant_scratch,
-                    g->raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT, raw_row_disk_bytes) == 0) {
-                payload_set_err(err, errlen, "turbo3 dequant to scratch failed on disk save");
-                rc = 1;
-            } else {
-                raw_cache_disk = g->raw_cache_dequant_scratch;
-            }
-        }
+        /* Phase 2c v2 disk write: stream raw bytes from the cache at the
+         * per-dtype row stride.  fp8 writes head_dim*4 bytes/row (unchanged
+         * from v1); turbo3 writes the packed turbo3 layout directly (no
+         * dequant pass on save). */
+        const uint64_t raw_row_disk_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_write_tensor_span(fp,
-                                           raw_cache_disk,
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                           g->layer_raw_cache[il],
+                                           (uint64_t)phys * raw_row_disk_bytes,
+                                           raw_row_disk_bytes,
                                            buf,
                                            DS4_SESSION_IO_CHUNK,
                                            err,
@@ -17451,12 +17460,35 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     uint64_t remaining = payload_bytes;
-    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+    /* Read magic + version first to dispatch between v1 (13 fields, kv_dtype
+     * implicit fp8) and v2 (14 fields, explicit kv_dtype).  Older files
+     * remain loadable; newer files refuse to load on older binaries. */
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {0};
+    if (payload_read_u32(fp, &h[0], &remaining, err, errlen) != 0) return 1;
+    if (payload_read_u32(fp, &h[1], &remaining, err, errlen) != 0) return 1;
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC) {
+        payload_set_err(err, errlen, "unsupported session payload version");
+        return 1;
+    }
+    uint32_t header_fields;
+    if (h[1] == DS4_SESSION_PAYLOAD_VERSION) {
+        header_fields = DS4_SESSION_PAYLOAD_U32_FIELDS;
+    } else if (h[1] == DS4_SESSION_PAYLOAD_VERSION_V1) {
+        header_fields = DS4_SESSION_PAYLOAD_U32_FIELDS_V1;
+    } else {
+        payload_set_err(err, errlen, "unsupported session payload version");
+        return 1;
+    }
+    for (uint32_t i = 2; i < header_fields; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
-        payload_set_err(err, errlen, "unsupported session payload version");
+    /* h[13] is the saved kv_dtype; v1 files leave it at the zero-init value
+     * DS4_KV_FP8 which is correct (v1 only ever stored fp8 floats). */
+    const uint32_t saved_kv_dtype = h[13];
+    if (saved_kv_dtype != (uint32_t)g_ds4_kv_dtype) {
+        payload_set_err(err, errlen,
+            "KV checkpoint dtype does not match the current session "
+            "(use --kv-cache to match, or discard the cache)");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -17691,47 +17723,27 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
+    /* Phase 2c v2 disk read: rows are stored at the per-dtype packed byte
+     * stride (matches the in-memory cache layout).  v1 files always have
+     * fp8 dtype, head_dim*4 bytes/row.  v2 turbo3 files have packed bytes. */
+    const uint64_t raw_row_disk_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         /* Rebuild the physical raw ring expected by the current graph.  This is
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
         const uint32_t raw_first = saved_tokens - saved_raw_live;
-        /* Phase 2 turbo3 disk load (interim): the file is in v1 float format
-         * but the cache is byte-packed.  Stream floats into the scratch
-         * tensor, then pack-batch from scratch into the cache.  Same
-         * interim-format compromise as the save path; checkpoint 5 adds the
-         * v2 format that streams packed bytes directly. */
-        ds4_gpu_tensor *raw_cache_load = g->layer_raw_cache[il];
-        const bool needs_pack_after = (g_ds4_kv_dtype == DS4_KV_TURBO3 &&
-                                       g->raw_cache_dequant_scratch != NULL);
-        if (needs_pack_after) {
-            raw_cache_load = g->raw_cache_dequant_scratch;
-        }
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
             rc = payload_read_tensor_span(fp,
-                                          raw_cache_load,
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                          g->layer_raw_cache[il],
+                                          (uint64_t)phys * raw_row_disk_bytes,
+                                          raw_row_disk_bytes,
                                           buf,
                                           DS4_SESSION_IO_CHUNK,
                                           &remaining,
                                           err,
                                           errlen);
-        }
-        if (rc == 0 && needs_pack_after) {
-            /* Pack the whole window from scratch back into the cache.  Pack
-             * is ring-aware so the per-row physical slot is preserved by
-             * setting pos0 = 0 and n_tokens = raw_cap. */
-            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
-            if (ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
-                    g->raw_cache_dequant_scratch, g->layer_raw_cache[il],
-                    g->raw_cap, 0u, g->raw_cap,
-                    DS4_N_HEAD_DIM, DS4_N_ROT, row_bytes) == 0) {
-                payload_set_err(err, errlen, "turbo3 pack-batch failed on disk load");
-                rc = 1;
-            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
