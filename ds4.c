@@ -1869,6 +1869,245 @@ static void dsv4_turbo3_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim,
     }
 }
 
+/* ── Packed-turbo3 byte-level helpers (Phase 2) ──────────────────────────────
+ *
+ * `pack_group64`: take 64 floats (already WHT-rotated in the group basis),
+ *  matched-norm L2 quantize them, write 24 bytes packed data + 1 FP8 scale.
+ *
+ * `unpack_group64`: inverse — take 24 bytes + 1 FP8 scale, expand to 64
+ *  rotated-basis floats (centroid * scale), then apply iWHT-with-signs to
+ *  return values in the original basis.
+ *
+ * The two together give a lossless-modulo-FP8-scale round trip: pack(unpack(B))
+ * recovers B byte-for-byte; unpack(pack(F)) gives F * (1 + per-group quant
+ * error).  The dequant on the read path goes:
+ *   24 bytes data, 1 byte scale --(LUT + FP8 cvt + mul)--> 64 rotated floats
+ *   --(iWHT-with-signs + 1/sqrt(64) + signs1)--> 64 original-basis floats
+ * which matches what the Phase 1 in-place float-sim already wrote for the
+ * same input, modulo the FP8 scale's E4M3 precision (~12% per group). */
+
+static unsigned char dsv4_turbo3_float_to_fp8_e4m3_cpu(float x) {
+    /* Match Atlas's `float_to_fp8` (sat to E4M3 max=448) via the matching CPU
+     * E4M3 dequant table search.  Stored as the nearest E4M3 grid value's
+     * 0..127 index encoded as a single byte; sign always positive here since
+     * matched-norm scale is non-negative.  We follow the same convention as
+     * `dsv4_e4m3fn_dequant_cpu` above so the CPU and CUDA paths agree. */
+    if (!(x > 0.0f)) return 0u; /* NaN-safe: matched_scale clamped > 0 */
+    if (x > 448.0f) x = 448.0f;
+    /* Use the existing e4m3 quantize: pick the nearest representable value via
+     * the same nearest-centroid binary search as `dsv4_e4m3fn_dequant_cpu`. */
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_cpu(mid) <= x) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(x - dsv4_e4m3fn_value_cpu(best));
+        const float next_diff = fabsf(x - dsv4_e4m3fn_value_cpu(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best++;
+        }
+    }
+    /* Encode as raw E4M3 byte: bit 7 = sign (0 here), bits 6..0 = index.
+     * Matches the bit pattern of `__nv_fp8_storage_t` storage. */
+    return (unsigned char)(best & 0x7f);
+}
+
+static float dsv4_turbo3_fp8_e4m3_to_float_cpu(unsigned char b) {
+    const int sign_bit = (b >> 7) & 1;
+    const int idx = b & 0x7f;
+    const float v = dsv4_e4m3fn_value_cpu(idx);
+    return sign_bit ? -v : v;
+}
+
+/* Pack 64 rotated-basis floats into 24 data bytes + 1 FP8 scale byte.
+ *
+ * data_out:   pointer to 24 contiguous bytes (the group's data slice).
+ * scale_out:  pointer to 1 byte (the group's FP8 scale slot).
+ * rotated:    the 64 floats in the rotated basis (already amax/norm-aware).
+ *
+ * The caller is responsible for having pre-rotated the input via the same
+ * WHT+signs1+signs2 pipeline used in Phase 1 — see
+ * dsv4_turbo3_kv_quantize_row_inplace_cpu for the canonical sequence.  We
+ * pack here AFTER the rotation; the iWHT is applied on the read side. */
+static void dsv4_turbo3_pack_group64_cpu(
+        unsigned char *data_out,
+        unsigned char *scale_out,
+        const float   *rotated) {
+    /* Per-group amax + L2 norm.  amax controls the codebook scale; L2 norm
+     * sets the matched-norm output scale. */
+    float amax = 0.0f, norm_sq = 0.0f;
+    for (int i = 0; i < 64; i++) {
+        const float v = rotated[i];
+        const float av = fabsf(v);
+        if (av > amax) amax = av;
+        norm_sq += v * v;
+    }
+    const float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX / amax) : 1.0f;
+
+    /* Quantize + matched-norm scale.  Same algorithm as Phase 1. */
+    int idx[64];
+    float recon_sq = 0.0f;
+    for (int i = 0; i < 64; i++) {
+        idx[i] = dsv4_turbo3_quantize_index_cpu(rotated[i] * k_inv);
+        const float c = DS4_TURBO3_CODEBOOK[idx[i]];
+        recon_sq += c * c;
+    }
+    const float recon_norm = sqrtf(recon_sq);
+    float scale = (recon_norm > 1e-10f) ? (sqrtf(norm_sq) / recon_norm)
+                                        : (amax / DS4_TURBO3_MAX);
+    if (scale > DS4_FP8_E4M3_MAX) scale = DS4_FP8_E4M3_MAX;
+    *scale_out = dsv4_turbo3_float_to_fp8_e4m3_cpu(scale);
+
+    /* Pack 64 indices into 24 bytes: 8 indices per 3 bytes, 8 chunks.
+     * Layout per chunk:
+     *   b0 = i0 | (i1 << 3) | (i2 << 6)
+     *   b1 = (i2 >> 2) | (i3 << 1) | (i4 << 4) | (i5 << 7)
+     *   b2 = (i5 >> 1) | (i6 << 2) | (i7 << 5)
+     * Identical to reshape_and_cache_flash_turbo3 in
+     * atlas/kernels/gb10/common/reshape_and_cache_turbo.cu. */
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const int *p = &idx[chunk * 8];
+        unsigned char *b = &data_out[chunk * 3];
+        b[0] = (unsigned char)((p[0])       | (p[1] << 3) | ((p[2] & 0x3) << 6));
+        b[1] = (unsigned char)((p[2] >> 2)  | (p[3] << 1) | (p[4] << 4) | ((p[5] & 0x1) << 7));
+        b[2] = (unsigned char)((p[5] >> 1)  | (p[6] << 2) | (p[7] << 5));
+    }
+}
+
+/* Unpack 24 data bytes + 1 FP8 scale into 64 rotated-basis floats.
+ *
+ * out:      64 floats in the rotated basis (centroid * scale, no iWHT).
+ * data_in:  24 contiguous bytes (the group's data slice).
+ * scale_in: 1 byte (the group's FP8 E4M3 matched-norm scale).
+ *
+ * Bit layout per 3-byte chunk (matches `nvfp4_dequant` in
+ * atlas/kernels/gb10/common/paged_decode_attn_turbo3_128.cu):
+ *   i0 = b0 & 7
+ *   i1 = (b0 >> 3) & 7
+ *   i2 = ((b0 >> 6) | (b1 << 2)) & 7
+ *   i3 = (b1 >> 1) & 7
+ *   i4 = (b1 >> 4) & 7
+ *   i5 = ((b1 >> 7) | (b2 << 1)) & 7
+ *   i6 = (b2 >> 2) & 7
+ *   i7 = (b2 >> 5) & 7   (top 3 bits — no overflow concern)
+ */
+static void dsv4_turbo3_unpack_group64_rotated_cpu(
+        float               *out,
+        const unsigned char *data_in,
+        unsigned char        scale_in) {
+    const float scale = dsv4_turbo3_fp8_e4m3_to_float_cpu(scale_in);
+    for (int chunk = 0; chunk < 8; chunk++) {
+        const unsigned char *b = &data_in[chunk * 3];
+        float *o = &out[chunk * 8];
+        const unsigned int b0 = b[0], b1 = b[1], b2 = b[2];
+        o[0] = DS4_TURBO3_CODEBOOK[(b0)               & 0x7] * scale;
+        o[1] = DS4_TURBO3_CODEBOOK[(b0 >> 3)          & 0x7] * scale;
+        o[2] = DS4_TURBO3_CODEBOOK[((b0 >> 6) | (b1 << 2)) & 0x7] * scale;
+        o[3] = DS4_TURBO3_CODEBOOK[(b1 >> 1)          & 0x7] * scale;
+        o[4] = DS4_TURBO3_CODEBOOK[(b1 >> 4)          & 0x7] * scale;
+        o[5] = DS4_TURBO3_CODEBOOK[((b1 >> 7) | (b2 << 1)) & 0x7] * scale;
+        o[6] = DS4_TURBO3_CODEBOOK[(b2 >> 2)          & 0x7] * scale;
+        o[7] = DS4_TURBO3_CODEBOOK[(b2 >> 5)          & 0x7] * scale;
+    }
+}
+
+/* Full pack: original-basis row -> packed bytes + RoPE tail.
+ *
+ * Applies forward Randomized Hadamard rotation per 64-element group, then
+ * pack_group64 for data+scale.  RoPE tail (last n_rot floats) copied straight
+ * through as little-endian floats at the end of the packed row. */
+static DS4_MAYBE_UNUSED void dsv4_turbo3_kv_pack_row_cpu(
+        unsigned char *dst,
+        const float   *src,
+        uint32_t       head_dim,
+        uint32_t       n_rot) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / DS4_TURBO3_GROUP_SIZE;
+    const int signs_on = dsv4_turbo_signs_enabled_cpu();
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+
+    float buf[DS4_TURBO3_GROUP_SIZE];
+    const float inv_sqrt_n = 1.0f / sqrtf((float)DS4_TURBO3_GROUP_SIZE);
+
+    for (uint32_t g = 0; g < n_groups; g++) {
+        /* Forward rotation: signs1 -> WHT -> 1/sqrt(64) -> signs2. */
+        const float *gs = src + (uint64_t)g * DS4_TURBO3_GROUP_SIZE;
+        if (signs_on) {
+            for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] = gs[i] * DS4_TURBO_SIGNS1_64[i];
+        } else {
+            for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] = gs[i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+
+        /* Pack into the data section + the group's scale slot. */
+        unsigned char *data_slot = dst + (uint64_t)g * 24u;
+        unsigned char *scale_slot = dst + data_bytes + (uint64_t)g;
+        dsv4_turbo3_pack_group64_cpu(data_slot, scale_slot, buf);
+    }
+
+    /* RoPE tail: raw floats appended at the end of the packed row. */
+    if (n_rot > 0) {
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        unsigned char *rope_slot = dst + data_bytes + scale_bytes;
+        memcpy(rope_slot, src + n_nope, (size_t)n_rot * sizeof(float));
+    }
+}
+
+/* Full unpack: packed bytes + RoPE tail -> original-basis floats.
+ *
+ * Inverse of dsv4_turbo3_kv_pack_row_cpu.  Per group: unpack to rotated
+ * floats, then iWHT-with-signs (signs2 -> WHT -> 1/sqrt(64) -> signs1) to
+ * return to the original basis.  RoPE tail copied straight back. */
+static DS4_MAYBE_UNUSED void dsv4_turbo3_kv_unpack_row_cpu(
+        float               *dst,
+        const unsigned char *src,
+        uint32_t             head_dim,
+        uint32_t             n_rot) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / DS4_TURBO3_GROUP_SIZE;
+    const int signs_on = dsv4_turbo_signs_enabled_cpu();
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const float inv_sqrt_n = 1.0f / sqrtf((float)DS4_TURBO3_GROUP_SIZE);
+
+    float buf[DS4_TURBO3_GROUP_SIZE];
+
+    for (uint32_t g = 0; g < n_groups; g++) {
+        const unsigned char *data_slot = src + (uint64_t)g * 24u;
+        const unsigned char scale_slot = src[data_bytes + g];
+        dsv4_turbo3_unpack_group64_rotated_cpu(buf, data_slot, scale_slot);
+
+        /* Inverse rotation: signs2 -> WHT -> 1/sqrt(64) -> signs1. */
+        if (signs_on) {
+            for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (uint32_t i = 0; i < DS4_TURBO3_GROUP_SIZE; i++) buf[i] *= DS4_TURBO_SIGNS1_64[i];
+        }
+
+        float *gd = dst + (uint64_t)g * DS4_TURBO3_GROUP_SIZE;
+        memcpy(gd, buf, sizeof(buf));
+    }
+
+    if (n_rot > 0) {
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        const unsigned char *rope_slot = src + data_bytes + scale_bytes;
+        memcpy(dst + n_nope, rope_slot, (size_t)n_rot * sizeof(float));
+    }
+}
+
 /* Active KV cache dtype.  Set once by ds4_engine_open from the parsed CLI flag
  * and read by the dispatch helper below.  File-scope so the seven existing
  * cache-store sites in this file (CPU prefill, CPU streaming-decode,
@@ -1913,6 +2152,35 @@ static int ds4_gpu_kv_store_raw_tensor_dispatch(
     return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, row, head_dim, n_rot);
 }
 #endif
+
+/* Per-row byte size in the cache for a given dtype.  See ds4.h for layout.
+ *
+ * fp8 (float-sim): plain `head_dim * sizeof(float)` row.
+ * turbo3 (packed): data (n_nope*3/8) + scales (n_nope/64) + RoPE tail (n_rot*4).
+ *   The data layout per 64-element group is 24 packed bytes (8 values per 3
+ *   bytes, repeated 8 times -> 24 = 8*3) and one FP8 E4M3 scale byte.  The
+ *   rope tail is appended as raw little-endian floats at the end of the row.
+ *
+ * Always returns >= head_dim*4 for fp8 and the packed total for turbo3 — no
+ * padding.  Callers that need alignment add it themselves. */
+uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype) {
+    if (head_dim <= n_rot) {
+        /* Pathological: no non-RoPE part to compress.  Fall back to floats. */
+        return (uint64_t)head_dim * sizeof(float);
+    }
+    if (dtype == DS4_KV_TURBO3) {
+        const uint32_t n_nope = head_dim - n_rot;
+        /* Round group count up.  ds4 invariably gives a 64-aligned n_nope
+         * (448 in practice) but the cast keeps the formula honest for future
+         * head shapes. */
+        const uint32_t n_groups = (n_nope + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
+        const uint64_t data_bytes = ((uint64_t)n_nope * 3u + 7u) / 8u;
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
+        return data_bytes + scale_bytes + rope_bytes;
+    }
+    return (uint64_t)head_dim * sizeof(float);
+}
 
 /* Public-name aliases for ds4_kv_dtype.  Used by the CLI and by tests so the
  * canonical strings live in one place. */
@@ -5024,7 +5292,10 @@ static void layer_kv_projection_normed_one_decode_scratch(
 }
 
 static float rope_yarn_ramp(float low, float high, int i0) {
-    const float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
+    /* (float)i0 / 2.0f, not (float)(i0/2) — keep the divide in float so we
+     * preserve sub-2 RoPE fractional dims and silence clang-tidy
+     * bugprone-integer-division. */
+    const float y = ((float)i0 / 2.0f - low) / fmaxf(0.001f, high - low);
     return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
 }
 
@@ -16181,6 +16452,20 @@ static int generate_metal_graph_raw_swa(
     return ok ? 0 : 1;
 }
 #endif
+
+ds4_kv_footprint ds4_kv_footprint_estimate(ds4_backend backend, int ctx_size, ds4_kv_dtype dtype) {
+    ds4_kv_footprint f = {0};
+    /* Reuse the existing cap arithmetic.  The float-vs-packed swap only
+     * affects raw_bytes (per-dtype row size); the compressed pools are kept
+     * float / F16 in Phase 2 (see docs/turbo3-roadmap.md for the deferred
+     * scope). */
+    const ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, dtype);
+    f.raw_bytes = (uint64_t)DS4_N_LAYER * m.raw_cap * row_bytes;
+    f.compressed_bytes = m.compressed_bytes;
+    f.total_bytes = f.raw_bytes + f.compressed_bytes;
+    return f;
+}
 
 #ifdef DS4_NO_GPU
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size) {
