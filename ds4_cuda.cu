@@ -3897,6 +3897,260 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+// Phase 2b Wave 1.3: inline-dequant turbo3 sibling of
+// attention_indexed_mixed_kernel.  Targets the n_tokens=1
+// decode-token hot path with comp_count > 0 (post-indexer selection).
+//
+// K-dot 8-lane partition is a clean fit for turbo3: 8 threads ×
+// 64 elements per row = exactly 7 groups (turbo3 dequant) + 1 RoPE
+// tail (64 floats).  Each thread owns one slice = one group OR the
+// RoPE tail, all kept in registers, then shfl-reduce.  No shared
+// dequant scratch needed for K-dot.
+//
+// V-acc reuses the cooperative-shmem pattern from
+// attention_decode_mixed_turbo3_kernel.
+//
+// Metal portability: K-dot 8-lane uses __shfl_down_sync which has a
+// direct SIMD-permute analogue on Metal (simd_shuffle_down).
+__global__ static void attention_indexed_mixed_turbo3_kernel(
+        float               *heads,
+        const float         *sinks,
+        const float         *q,
+        const unsigned char *raw_kv_bytes,
+        uint64_t             row_bytes,
+        const float         *comp_kv,
+        const int32_t       *topk,
+        uint32_t             n_tokens,
+        uint32_t             pos0,
+        uint32_t             n_raw,
+        uint32_t             raw_cap,
+        uint32_t             raw_start,
+        uint32_t             n_comp,
+        uint32_t             top_k,
+        uint32_t             window,
+        uint32_t             ratio,
+        uint32_t             n_head,
+        uint32_t             head_dim,
+        uint32_t             n_rot,
+        int                  signs_on) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_groups = n_nope / TURBO3_GROUP_SIZE;
+    const uint64_t data_bytes = (uint64_t)n_nope * 3u / 8u;
+    const uint64_t scale_bytes = (uint64_t)n_groups;
+    uint32_t qpos = pos0 + t;
+    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float scores[768];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count;
+    __shared__ float kv_scratch[512];
+    float scale = rsqrtf((float)head_dim);
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        comp_count = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
+        int32_t c = topk[(uint64_t)t * top_k + i];
+        if (c >= 0 && (uint32_t)c < visible_comp) {
+            uint32_t slot = atomicAdd(&comp_count, 1u);
+            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (comp_count > 512u) comp_count = 512u;
+    }
+    __syncthreads();
+    uint32_t n_score = raw_count + comp_count;
+    float local_max = sinks[h];
+
+    if (comp_count == 0) {
+        for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+            const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+            float dot = 0.0f;
+            float group[64];
+            for (uint32_t g = 0; g < n_groups; g++) {
+                turbo3_dequant_group64_device(group, kv_bytes, g, n_nope, signs_on);
+                #pragma unroll
+                for (uint32_t i = 0; i < 64; i++) {
+                    dot += qh[g * 64 + i] * group[i];
+                }
+            }
+            const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+            for (uint32_t d = 0; d < n_rot; d++) {
+                dot += qh[n_nope + d] * turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+            }
+            scores[r] = dot * scale;
+            local_max = fmaxf(local_max, scores[r]);
+        }
+    } else {
+        // 8-lane K-dot.  Each warp split into 4 row-groups (qgroup), each
+        // group of 8 threads shares one row.  For raw rows, each thread
+        // owns either one turbo3 group (qlane < n_groups) or the RoPE
+        // tail (qlane == n_groups, n_rot=64).  For comp rows, traditional
+        // stride-of-8 float read.
+        uint32_t qlane = threadIdx.x & 7u;
+        uint32_t qgroup = threadIdx.x >> 3u;
+        for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
+            uint32_t row = row0 + qgroup;
+            if (row < n_score) {
+                float dot = 0.0f;
+                if (row < raw_count) {
+                    const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[row] * row_bytes;
+                    if (qlane < n_groups) {
+                        float group[64];
+                        turbo3_dequant_group64_device(group, kv_bytes, qlane, n_nope, signs_on);
+                        const float *qh_slice = qh + (uint64_t)qlane * 64u;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 64; i++) {
+                            dot += qh_slice[i] * group[i];
+                        }
+                    } else if (qlane == n_groups && n_rot == 64u) {
+                        const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                        const float *qh_slice = qh + n_nope;
+                        for (uint32_t d = 0; d < n_rot; d++) {
+                            dot += qh_slice[d] * turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+                        }
+                    }
+                } else {
+                    uint32_t c = row - raw_count;
+                    const float *kvrow = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                        dot += qh[d] * kvrow[d];
+                    }
+                }
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (qlane == 0) scores[row] = dot * scale;
+            }
+        }
+        __syncthreads();
+        for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+            local_max = fmaxf(local_max, scores[i]);
+        }
+    }
+
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+
+    // V-acc: cooperative shmem dequant per row + comp_kv float reads.
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        uint32_t d0 = threadIdx.x;
+        uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+            if (threadIdx.x < n_groups) {
+                float buf[64];
+                turbo3_dequant_group64_device(buf, kv_bytes, threadIdx.x, n_nope, signs_on);
+                float *gd = kv_scratch + (uint64_t)threadIdx.x * TURBO3_GROUP_SIZE;
+                #pragma unroll
+                for (uint32_t i = 0; i < 64; i++) gd[i] = buf[i];
+            }
+            if (threadIdx.x >= n_groups && threadIdx.x < n_groups + n_rot) {
+                const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                uint32_t d = threadIdx.x - n_groups;
+                kv_scratch[n_nope + d] = turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+            }
+            __syncthreads();
+            float s = scores[r];
+            acc0 += kv_scratch[d0] * s;
+            acc1 += kv_scratch[d1] * s;
+            __syncthreads();
+        }
+        for (uint32_t c = 0; c < comp_count; c++) {
+            float s = scores[raw_count + c];
+            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            // Slow generic path retains the original per-thread per-d loop
+            // structure but with inline dequant per row.  Each thread
+            // re-dequants the group containing its d for every row — wasted
+            // work; the fast path above is the optimized one.  Kept for
+            // shape coverage (non-(512,256) launches if any).
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const unsigned char *kv_bytes = raw_kv_bytes + (uint64_t)raw_rows[r] * row_bytes;
+                float v;
+                if (d < n_nope) {
+                    float buf[64];
+                    turbo3_dequant_group64_device(buf, kv_bytes, d / 64u, n_nope, signs_on);
+                    v = buf[d & 63u];
+                } else {
+                    const unsigned char *rope_tail = kv_bytes + data_bytes + scale_bytes;
+                    v = turbo3_load_unaligned_f32(rope_tail + (d - n_nope) * sizeof(float));
+                }
+                acc += v * scores[r];
+            }
+            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)comp_rows[s] * head_dim + d] * scores[raw_count + s];
+            oh[d] = acc / denom;
+        }
+    }
+}
+
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -8334,6 +8588,74 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   n_head,
                                                   head_dim);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
+}
+
+/* Phase 2b Wave 1.3 entry point: turbo3-packed sibling of
+ * ds4_gpu_attention_indexed_mixed_batch_heads_tensor.  Reads packed
+ * turbo3 raw cache directly via attention_indexed_mixed_turbo3_kernel.
+ *
+ * Restricted to the n_tokens=1 decode-token Wave 1 fallback (the
+ * heads8_online and rb4 paths are not migrated yet — Wave 2/3 work).
+ * Returns 0 on any unsupported shape so the caller can fall back to
+ * the float path via view_dispatch. */
+extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              top_k,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (comp_kv_f16 ||
+        !heads || !q || !raw_kv_bytes || !comp_kv || !topk || !model_map ||
+        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
+        n_comp == 0 || top_k == 0 ||
+        n_rot > head_dim ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv_bytes->bytes < (uint64_t)raw_cap * row_bytes ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
+        return 0;
+    }
+    if (top_k > 512u) return 0;
+    /* Wave 1.3 covers only the Wave 1 fallback (n_tokens=1, no
+     * heads8_online, no rb4).  Caller must fall back for other shapes. */
+    if (n_tokens != 1u) return 0;
+    if (head_dim != 512u) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(n_tokens, n_head, 1);
+    attention_indexed_mixed_turbo3_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const unsigned char *)raw_kv_bytes->ptr,
+            row_bytes,
+            (const float *)comp_kv->ptr,
+            (const int32_t *)topk->ptr,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head, head_dim, n_rot,
+            ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "attention indexed mixed turbo3 launch");
 }
 
 static int attention_prefill_mixed_launch(

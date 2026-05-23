@@ -10569,33 +10569,65 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
-            /* Indexed mixed path: kernel still needs float input, so
-             * dequant to scratch.  Wave 2 will migrate this kernel. */
-            ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
-                    raw_cache, dequant_scratch,
-                    raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
-            if (!raw_cache_attn) ok = false;
-            if (ok) ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
-                    g->heads,
-                    model->map,
-                    model->size,
-                    layer->attn_sinks->abs_offset,
-                    g->q,
-                    raw_cache_attn,
-                    g->layer_attn_comp_cache[il],
-                    metal_graph_attn_comp_cache_is_f16(),
-                    comp_selected,
-                    1,
-                    pos,
-                    n_raw,
-                    raw_cap,
-                    raw_start,
-                    n_comp,
-                    n_selected,
-                    g->raw_window,
-                    ds4_layer_compress_ratio(il),
-                    DS4_N_HEAD,
-                    DS4_N_HEAD_DIM) != 0;
+            /* Indexed mixed path.  Phase 2b Wave 1.3 ships an inline-dequant
+             * turbo3 sibling for the n_tokens=1 fallback kernel (covers
+             * decode-token, the hot path).  heads8_online / rb4 paths still
+             * need float — fall back to view_dispatch when the turbo3
+             * launcher returns 0. */
+            int turbo3_rc = 0;
+            if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+                const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
+                turbo3_rc = ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
+                        g->heads,
+                        model->map,
+                        model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q,
+                        raw_cache, row_bytes,
+                        g->layer_attn_comp_cache[il],
+                        metal_graph_attn_comp_cache_is_f16(),
+                        comp_selected,
+                        1,
+                        pos,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        n_selected,
+                        g->raw_window,
+                        ds4_layer_compress_ratio(il),
+                        DS4_N_HEAD,
+                        DS4_N_HEAD_DIM, DS4_N_ROT);
+            }
+            if (turbo3_rc == 0) {
+                ds4_gpu_tensor *raw_cache_attn = (g_ds4_kv_dtype == DS4_KV_TURBO3)
+                        ? ds4_gpu_kv_attention_view_dispatch(
+                              raw_cache, dequant_scratch,
+                              raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT)
+                        : raw_cache;
+                if (!raw_cache_attn) ok = false;
+                if (ok) ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                        g->heads,
+                        model->map,
+                        model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q,
+                        raw_cache_attn,
+                        g->layer_attn_comp_cache[il],
+                        metal_graph_attn_comp_cache_is_f16(),
+                        comp_selected,
+                        1,
+                        pos,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        n_selected,
+                        g->raw_window,
+                        ds4_layer_compress_ratio(il),
+                        DS4_N_HEAD,
+                        DS4_N_HEAD_DIM) != 0;
+            }
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
