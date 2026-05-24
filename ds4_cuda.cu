@@ -3711,6 +3711,9 @@ __global__ static void attention_decode_mixed_turbo3_kernel(
             for (uint32_t i = 0; i < ROWS_PER_TILE; i++) {
                 if (i < tile_rows) {
                     float s = scores[r_base + i];
+                    /* Sparse V (TQ+): skip rows below noise threshold.
+                     * No PPL impact since `w * V` is below fp16 precision. */
+                    if (s < 1.0e-6f) continue;
                     acc0 += kv_tile[(uint64_t)i * 512u + d0] * s;
                     acc1 += kv_tile[(uint64_t)i * 512u + d1] * s;
                 }
@@ -3719,6 +3722,9 @@ __global__ static void attention_decode_mixed_turbo3_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
+            /* Sparse V: skip comp_kv rows below noise threshold.
+             * Saves the kv pointer dereference + 2 device reads + 2 muls. */
+            if (s < 1.0e-6f) continue;
             const float *kv = comp_kv + (uint64_t)c * head_dim;
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
@@ -3956,6 +3962,9 @@ __global__ static void attention_decode_mixed_turbo4_kernel(
             for (uint32_t i = 0; i < ROWS_PER_TILE; i++) {
                 if (i < tile_rows) {
                     float s = scores[r_base + i];
+                    /* Sparse V (TQ+): skip rows below noise threshold.
+                     * No PPL impact since `w * V` is below fp16 precision. */
+                    if (s < 1.0e-6f) continue;
                     acc0 += kv_tile[(uint64_t)i * 512u + d0] * s;
                     acc1 += kv_tile[(uint64_t)i * 512u + d1] * s;
                 }
@@ -3964,6 +3973,9 @@ __global__ static void attention_decode_mixed_turbo4_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
+            /* Sparse V: skip comp_kv rows below noise threshold.
+             * Saves the kv pointer dereference + 2 device reads + 2 muls. */
+            if (s < 1.0e-6f) continue;
             const float *kv = comp_kv + (uint64_t)c * head_dim;
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
@@ -4165,6 +4177,9 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
+            /* Sparse V: skip comp_kv rows below noise threshold.
+             * Saves the kv pointer dereference + 2 device reads + 2 muls. */
+            if (s < 1.0e-6f) continue;
             const float *kv = comp_kv + (uint64_t)c * head_dim;
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
@@ -4411,6 +4426,9 @@ __global__ static void attention_indexed_mixed_turbo3_kernel(
             for (uint32_t i = 0; i < ROWS_PER_TILE; i++) {
                 if (i < tile_rows) {
                     float s = scores[r_base + i];
+                    /* Sparse V (TQ+): skip rows below noise threshold.
+                     * No PPL impact since `w * V` is below fp16 precision. */
+                    if (s < 1.0e-6f) continue;
                     acc0 += kv_tile[(uint64_t)i * 512u + d0] * s;
                     acc1 += kv_tile[(uint64_t)i * 512u + d1] * s;
                 }
