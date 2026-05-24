@@ -661,7 +661,7 @@ kernel void kernel_dsv4_attention_decode_mixed_turbo3_f32(
     // float tile.  Half mantissa loses ~1e-3 relative precision per V
     // element — softmax weights sum to 1.0 so accumulated drift stays in
     // the noise floor (verified via output coherence parity vs CUDA).
-    constexpr uint ROWS_PER_TILE = 16u;
+    constexpr uint ROWS_PER_TILE = 20u;
     threadgroup half kv_tile_h[ROWS_PER_TILE * 512u];
     const uint d0 = tid;
     const uint d1 = d0 + 256u;
@@ -1154,7 +1154,7 @@ kernel void kernel_dsv4_attention_decode_mixed_turbo4_f32(
 
     device float *oh = heads + ((ulong)t * args.n_head + h) * args.head_dim;
     // Half tile → ROWS_PER_TILE=16 (same trick as turbo3 above).
-    constexpr uint ROWS_PER_TILE = 16u;
+    constexpr uint ROWS_PER_TILE = 20u;
     threadgroup half kv_tile_h[ROWS_PER_TILE * 512u];
     const uint d0 = tid;
     const uint d1 = d0 + 256u;
@@ -1526,7 +1526,7 @@ kernel void kernel_dsv4_attention_decode_mixed_turbo2_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device float *oh = heads + ((ulong)t * args.n_head + h) * args.head_dim;
-    constexpr uint ROWS_PER_TILE = 16u;
+    constexpr uint ROWS_PER_TILE = 20u;
     threadgroup half kv_tile_h[ROWS_PER_TILE * 512u];
     const uint d0 = tid;
     const uint d1 = d0 + 256u;
