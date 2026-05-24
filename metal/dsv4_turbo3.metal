@@ -1382,3 +1382,195 @@ kernel void kernel_dsv4_turbo2_kv_dequant_to_scratch_f32(
         }
     }
 }
+
+// turbo2 inline-dequant attention decode kernel — Wave M3 sibling.  Reads
+// packed 2-bit rows directly.  Same half-tile + ROWS_PER_TILE=16 V-acc as
+// turbo3/turbo4.
+struct ds4_metal_args_attn_decode_mixed_turbo2 {
+    uint64_t row_bytes;
+    uint32_t use_comp_mask;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    int      signs_on;
+};
+
+kernel void kernel_dsv4_attention_decode_mixed_turbo2_f32(
+        device       float *heads        [[ buffer(0) ]],
+        device const float *sinks        [[ buffer(1) ]],
+        device const float *q            [[ buffer(2) ]],
+        device const uchar *raw_kv_bytes [[ buffer(3) ]],
+        device const half  *comp_kv      [[ buffer(4) ]],
+        device const float *comp_mask    [[ buffer(5) ]],
+        constant struct ds4_metal_args_attn_decode_mixed_turbo2 &args [[ buffer(6) ]],
+        uint3   tg_pos_v             [[ threadgroup_position_in_grid ]],
+        uint3   tid_v                [[ thread_position_in_threadgroup ]],
+        uint3   tpt_v                [[ threads_per_threadgroup ]]) {
+    const uint t              = tg_pos_v.x;
+    const uint h              = tg_pos_v.y;
+    const uint tid            = tid_v.x;
+    const uint threads_per_tg = tpt_v.x;
+    if (t >= args.n_tokens || h >= args.n_head) return;
+
+    const uint  n_nope     = args.head_dim - args.n_rot;
+    const uint  n_groups   = n_nope / DS4_TURBO3_GROUP_SIZE;
+    const ulong data_bytes = (ulong)n_nope / 4u;
+    const ulong scale_bytes= (ulong)n_groups;
+    const bool  single_all = (args.n_tokens == 1u && args.ratio == 0u);
+    const uint  qpos       = args.pos0 + t;
+    const uint  first_raw_pos = args.pos0 + args.n_tokens - args.n_raw;
+    uint visible_comp = single_all ? args.n_comp
+                                    : (args.n_comp ? (qpos + 1u) / args.ratio : 0u);
+    if (visible_comp > args.n_comp) visible_comp = args.n_comp;
+    device const float *qh = q + ((ulong)t * args.n_head + h) * args.head_dim;
+
+    constexpr uint TURBO2_DECODE_SCORE_CAP = 2048u;
+    threadgroup float    scores[TURBO2_DECODE_SCORE_CAP];
+    threadgroup uint     raw_rows[256];
+    threadgroup float    partial[256];
+    threadgroup float    max_s;
+    threadgroup float    denom;
+    threadgroup uint     raw_count;
+    threadgroup uint     raw_first_idx;
+    const float scale = rsqrt((float)args.head_dim);
+
+    if (tid == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        if (args.n_raw != 0) {
+            const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+            if (single_all) {
+                raw_count = args.n_raw > 256u ? 256u : args.n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint lo = first_raw_pos;
+                if (args.window != 0 && qpos + 1u > args.window) {
+                    const uint wlo = qpos + 1u - args.window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = tid; r < raw_count; r += threads_per_tg) {
+        raw_rows[r] = (args.raw_start + raw_first_idx + r) % args.raw_cap;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n_score = raw_count + visible_comp;
+    float local_max = sinks[h];
+
+    for (uint r = tid; r < raw_count; r += threads_per_tg) {
+        device const uchar *kv_bytes = raw_kv_bytes + (ulong)raw_rows[r] * args.row_bytes;
+        float dot = 0.0f;
+        float group[64];
+        for (uint g = 0; g < n_groups; g++) {
+            turbo2_dequant_group64(group, kv_bytes, g, n_nope, args.signs_on);
+            for (uint i = 0; i < 64; i++) {
+                dot += qh[g * 64 + i] * group[i];
+            }
+        }
+        device const uchar *rope_tail = kv_bytes + data_bytes + scale_bytes;
+        for (uint d = 0; d < args.n_rot; d++) {
+            dot += qh[n_nope + d] * turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+        }
+        scores[r] = dot * scale;
+        local_max = max(local_max, scores[r]);
+    }
+    for (uint c = tid; c < visible_comp; c += threads_per_tg) {
+        float add = args.use_comp_mask ? comp_mask[(ulong)t * args.n_comp + c] : 0.0f;
+        float s = -INFINITY;
+        if (add > -1.0e20f) {
+            device const half *kvrow = comp_kv + (ulong)c * args.head_dim;
+            float dot = 0.0f;
+            for (uint d = 0; d < args.head_dim; d++) dot += qh[d] * (float)kvrow[d];
+            s = dot * scale + add;
+        }
+        scores[raw_count + c] = s;
+        local_max = max(local_max, s);
+    }
+
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads_per_tg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) max_s = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float den_local = 0.0f;
+    for (uint i = tid; i < n_score; i += threads_per_tg) {
+        scores[i] = exp(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[tid] = den_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads_per_tg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] = partial[tid] + partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) denom = partial[0] + exp(sinks[h] - max_s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *oh = heads + ((ulong)t * args.n_head + h) * args.head_dim;
+    constexpr uint ROWS_PER_TILE = 16u;
+    threadgroup half kv_tile_h[ROWS_PER_TILE * 512u];
+    const uint d0 = tid;
+    const uint d1 = d0 + 256u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint r_base = 0; r_base < raw_count; r_base += ROWS_PER_TILE) {
+        uint tile_rows = raw_count - r_base;
+        if (tile_rows > ROWS_PER_TILE) tile_rows = ROWS_PER_TILE;
+        const uint total_groups = tile_rows * n_groups;
+        if (tid < total_groups) {
+            const uint tr = tid / n_groups;
+            const uint g  = tid % n_groups;
+            device const uchar *kv_bytes = raw_kv_bytes + (ulong)raw_rows[r_base + tr] * args.row_bytes;
+            float buf[64];
+            turbo2_dequant_group64(buf, kv_bytes, g, n_nope, args.signs_on);
+            threadgroup half *gd = kv_tile_h + (ulong)tr * 512u + (ulong)g * DS4_TURBO3_GROUP_SIZE;
+            for (uint i = 0; i < 64; i++) gd[i] = (half)buf[i];
+        }
+        const uint total_rope = tile_rows * args.n_rot;
+        for (uint idx = tid; idx < total_rope; idx += threads_per_tg) {
+            const uint tr = idx / args.n_rot;
+            const uint d  = idx % args.n_rot;
+            device const uchar *rope_tail = raw_kv_bytes
+                    + (ulong)raw_rows[r_base + tr] * args.row_bytes
+                    + data_bytes + scale_bytes;
+            kv_tile_h[(ulong)tr * 512u + n_nope + d] =
+                    (half)turbo3_load_unaligned_f32(rope_tail + d * sizeof(float));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < ROWS_PER_TILE; i++) {
+            if (i < tile_rows) {
+                float s = scores[r_base + i];
+                acc0 += (float)kv_tile_h[(ulong)i * 512u + d0] * s;
+                acc1 += (float)kv_tile_h[(ulong)i * 512u + d1] * s;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint c = 0; c < visible_comp; c++) {
+        float s = scores[raw_count + c];
+        device const half *kv = comp_kv + (ulong)c * args.head_dim;
+        acc0 += (float)kv[d0] * s;
+        acc1 += (float)kv[d1] * s;
+    }
+    oh[d0] = acc0 / denom;
+    oh[d1] = acc1 / denom;
+}

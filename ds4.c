@@ -10887,9 +10887,17 @@ static bool metal_graph_encode_decode_layer(
                         metal_graph_attn_comp_cache_is_f16(),
                         n_comp, NULL, 0,
                         DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+            } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+                rc = ds4_gpu_attention_decode_heads_turbo2_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes, n_raw,
+                        raw_cap, raw_start,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        n_comp, NULL, 0,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
             }
-            /* turbo2 has no inline-dequant attention kernel — always
-             * falls back to M1 dequant-to-scratch + fp8 attention. */
             if (rc == 0) {
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
                         raw_cache, dequant_scratch,
@@ -12754,6 +12762,23 @@ static bool metal_graph_encode_layer_attention_batch(
         } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO4);
             turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo4_heads_tensor(
+                    g->batch_heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q,
+                    g->layer_raw_cache[il], row_bytes,
+                    /* comp_kv  */ NULL,
+                    /* comp_kv_f16 */ 0,
+                    /* comp_mask */ NULL,
+                    /* use_comp_mask */ 0,
+                    n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                    /* n_comp */ 0,
+                    g->raw_window,
+                    /* ratio */ 0,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+        } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO2);
+            turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo2_heads_tensor(
                     g->batch_heads,
                     model->map, model->size,
                     layer->attn_sinks->abs_offset,
