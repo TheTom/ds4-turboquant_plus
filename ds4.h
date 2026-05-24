@@ -54,6 +54,11 @@ typedef enum {
 } ds4_kv_dtype;
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
+/* Seed the active dtype globals.  engine_open does this too; useful
+ * for tooling (ds4-bench's footprint estimator) that runs before
+ * engine_open and needs the per-dtype row-bytes math to be correct. */
+void ds4_kv_set_active_dtype(ds4_kv_dtype dtype);
+void ds4_comp_set_active_dtype(ds4_kv_dtype dtype);
 
 /* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 - the same WHT
  * group cadence the float-sim quantizer uses, one matched-norm L2 scale per

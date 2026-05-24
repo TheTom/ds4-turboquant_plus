@@ -764,6 +764,10 @@ static int run_ppl_mode(const bench_config *cfg) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    /* Seed dtype globals so the footprint estimators below pick the
+     * per-dtype row-bytes math.  engine_open re-seeds; idempotent. */
+    ds4_kv_set_active_dtype(cfg.kv_dtype);
+    ds4_comp_set_active_dtype(cfg.comp_dtype);
     if (cfg.ppl_prompt_path) {
         return run_ppl_mode(&cfg);
     }

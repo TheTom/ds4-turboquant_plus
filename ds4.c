@@ -2212,8 +2212,8 @@ static ds4_kv_dtype g_ds4_kv_dtype = DS4_KV_FP8;
  * packs comp rows to 200 B (10.24x vs float, 5.12x vs f16 staging). */
 static ds4_kv_dtype g_ds4_comp_dtype = DS4_KV_FP8;
 
-static void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype; }
-static void ds4_comp_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_comp_dtype = dtype; }
+void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype; }
+void ds4_comp_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_comp_dtype = dtype; }
 
 /* Returns 1 when the active dtype uses the packed-byte row layout (turbo3 or
  * turbo4), 0 for the historical fp8 float-stride path.  Use this for layout
@@ -9593,7 +9593,7 @@ static bool metal_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || g_ds4_comp_dtype == DS4_KV_TURBO3) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -9686,10 +9686,14 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
-                    managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            /* Phase 7.4: skip float pool alloc when comp_dtype=TURBO3.
+             * Stage + packed pool cover write + storage. */
+            if (g_ds4_comp_dtype != DS4_KV_TURBO3) {
+                g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                        (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            }
             /* Phase 7.1: packed companion pool when --comp-cache turbo3. */
             if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
                 const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
@@ -9748,7 +9752,7 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || g_ds4_comp_dtype == DS4_KV_TURBO3) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
@@ -9850,7 +9854,11 @@ static bool metal_graph_alloc_raw_cap(
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
-            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
+            /* Phase 7.4: float pool intentionally NULL when comp_dtype=TURBO3 */
+            const bool comp_pool_ok = (g_ds4_comp_dtype == DS4_KV_TURBO3)
+                ? (g->layer_attn_comp_cache_packed[il] != NULL && g->attn_comp_stage != NULL)
+                : (g->layer_attn_comp_cache[il] != NULL);
+            layer_cache_ok = comp_pool_ok &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
                              (!enable_mtp ||
@@ -10145,12 +10153,27 @@ static bool metal_graph_store_attn_comp_stage(
         uint32_t       rows) {
     if (!g || il >= DS4_N_LAYER) return false;
     if (rows == 0) return true;
-    if (!g->layer_attn_comp_cache[il] || !g->attn_comp_stage) return false;
+    if (!g->attn_comp_stage) return false;
     if (rows > g->attn_comp_stage_cap || first_row > g->layer_comp_cap[il] ||
         rows > g->layer_comp_cap[il] - first_row) {
         return false;
     }
 
+    /* Phase 7.4: pack stage rows directly to the packed comp pool. */
+    if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
+        if (!g->layer_attn_comp_cache_packed[il]) return false;
+        const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+        int rc = ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+                g->attn_comp_stage,
+                g->layer_attn_comp_cache_packed[il],
+                rows,
+                /* dst_first_row */ (uint64_t)first_row,
+                DS4_N_HEAD_DIM,
+                comp_row_bytes);
+        return rc != 0;
+    }
+
+    if (!g->layer_attn_comp_cache[il]) return false;
     const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
     const uint64_t dst_offset = (uint64_t)first_row *
                                 metal_graph_attn_comp_cache_row_bytes();
@@ -10169,16 +10192,23 @@ static bool metal_graph_store_attn_comp_stage(
                                count * sizeof(float)) != 0;
 }
 
+/* Phase 7.4: route compressor writes through attn_comp_stage when
+ * comp_dtype=TURBO3 (same as F16 path), so the float pool can stay
+ * sized for staging only.  commit packs stage -> packed pool. */
+static bool metal_graph_comp_uses_stage(void) {
+    return DS4_GPU_ATTN_COMP_CACHE_F16 || g_ds4_comp_dtype == DS4_KV_TURBO3;
+}
+
 static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16
+    return metal_graph_comp_uses_stage()
         ? g->attn_comp_stage
         : g->layer_attn_comp_cache[il];
 }
 
 static uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
+    return metal_graph_comp_uses_stage() ? 0u : row;
 }
 
 static bool metal_graph_commit_attn_comp_stage(
@@ -10186,7 +10216,7 @@ static bool metal_graph_commit_attn_comp_stage(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) return true;
+    if (!metal_graph_comp_uses_stage()) return true;
     return metal_graph_store_attn_comp_stage(g, il, first_row, rows);
 }
 
@@ -10194,7 +10224,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (metal_graph_comp_uses_stage()) {
         return ds4_gpu_tensor_view(g->attn_comp_stage,
                                    0,
                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -10209,7 +10239,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         uint32_t       il,
         uint32_t       first_row,
         uint32_t       rows) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
+    if (metal_graph_comp_uses_stage()) return g->attn_comp_stage;
     const uint32_t view_rows = rows ? rows : 1u;
     return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
@@ -10217,7 +10247,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
 }
 
 static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
+    if (!metal_graph_comp_uses_stage()) ds4_gpu_tensor_free(t);
 }
 
 /* Phase 7.3: pick the comp_kv tensor an attention kernel should read.
@@ -10560,7 +10590,12 @@ static bool metal_graph_encode_decode_layer(
             if (!comp_row_view) {
                 ok = false;
             } else {
-                ok = ds4_gpu_kv_quantize_tensor_dispatch(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                /* Phase 7.4: when comp_dtype=TURBO3, commit packs stage->packed
+                 * directly.  Skip the in-place fp8/turbo3 quantize that would
+                 * leave bytes in the stage buffer instead of floats. */
+                if (g_ds4_comp_dtype != DS4_KV_TURBO3) {
+                    ok = ds4_gpu_kv_quantize_tensor_dispatch(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                }
                 if (ok) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
@@ -12909,21 +12944,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 for (uint32_t t = 0; t < n_tokens; t++) {
                     comp_counts[t] = (pos0 + t + 1u) / ratio;
                 }
-                /* Phase 7.2: dual-write packed companion when comp_dtype=turbo3.
-                 * Pack the float rows the compressor just wrote into the
-                 * packed pool.  Full-prefill path -> rows start at 0. */
-                if (ok && g_ds4_comp_dtype == DS4_KV_TURBO3 &&
-                    g->layer_attn_comp_cache_packed[il] != NULL && n_comp != 0) {
-                    const uint64_t comp_row_bytes =
-                            ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
-                    ok = ds4_gpu_dsv4_turbo3_comp_pack_tensor(
-                            attn_comp_target,
-                            g->layer_attn_comp_cache_packed[il],
-                            n_comp,
-                            /* dst_first_row */ 0,
-                            DS4_N_HEAD_DIM,
-                            comp_row_bytes) != 0;
-                }
+                /* Phase 7.4: commit_attn_comp_stage above already packed
+                 * stage->packed pool when comp_dtype=TURBO3. */
                 if (n_comp != 0) {
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   attn_comp_target,
@@ -13036,22 +13058,8 @@ static bool metal_graph_encode_layer_attention_batch(
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
                         }
                     }
-                    /* Phase 7.2: dual-write packed companion for the chunked
-                     * prefill path.  Pack the float rows just written
-                     * (comp_chunk rows starting at comp_before) into the
-                     * packed pool at the matching row offset. */
-                    if (g_ds4_comp_dtype == DS4_KV_TURBO3 &&
-                        g->layer_attn_comp_cache_packed[il] != NULL && comp_chunk != 0) {
-                        const uint64_t comp_row_bytes =
-                                ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
-                        ok = ds4_gpu_dsv4_turbo3_comp_pack_tensor(
-                                attn_comp_target,
-                                g->layer_attn_comp_cache_packed[il],
-                                comp_chunk,
-                                /* dst_first_row */ (uint64_t)comp_before,
-                                DS4_N_HEAD_DIM,
-                                comp_row_bytes) != 0;
-                    }
+                    /* Phase 7.4: commit_attn_comp_stage above already packed
+                     * stage->packed pool when comp_dtype=TURBO3. */
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   attn_comp_target,
                                                   (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
@@ -15499,9 +15507,13 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
-            m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            /* Phase 7.4: with comp_dtype=TURBO3 the float pool is gone and
+             * storage is just the packed pool (~4.75x smaller per row). */
+            const uint64_t per_row_bytes = (g_ds4_comp_dtype == DS4_KV_TURBO3)
+                ? ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3)
+                : (uint64_t)DS4_N_HEAD_DIM *
+                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            m.compressed_bytes += (uint64_t)layer_comp_cap * per_row_bytes;
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -15515,6 +15527,12 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                           m.prefill_cap *
                           sizeof(float) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
+        /* Phase 7.4: also account for the comp_cache_dequant_scratch
+         * tensor (float, sized for max comp_cap rows) and the staging
+         * buffer that becomes always-allocated on CUDA with turbo3. */
+        if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
+            m.scratch_bytes += (uint64_t)m.comp_cap * DS4_N_HEAD_DIM * sizeof(float);
+        }
     } else {
         m.raw_cap = ds4_default_raw_cap(ctx);
         m.raw_bytes = (uint64_t)DS4_N_LAYER *
