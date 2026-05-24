@@ -10234,11 +10234,15 @@ static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
  * Phase 7.4). */
 static ds4_gpu_tensor *metal_graph_comp_kv_for_attn(
         ds4_gpu_graph *g, uint32_t il, uint32_t n_comp) {
-    if (g_ds4_comp_dtype != DS4_KV_TURBO3 ||
-        n_comp == 0 ||
-        g->layer_attn_comp_cache_packed[il] == NULL ||
-        g->comp_cache_dequant_scratch == NULL) {
+    if (g_ds4_comp_dtype != DS4_KV_TURBO3) {
         return g->layer_attn_comp_cache[il];
+    }
+    /* Phase 7.4: float pool is NULL on this path.  Always return the
+     * scratch (a valid tensor) - attention kernels with n_comp=0 won't
+     * read it, but they need a non-NULL pointer. */
+    if (g->comp_cache_dequant_scratch == NULL) return NULL;
+    if (n_comp == 0 || g->layer_attn_comp_cache_packed[il] == NULL) {
+        return g->comp_cache_dequant_scratch;
     }
     const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
     if (ds4_gpu_dsv4_turbo3_comp_dequant_to_scratch_tensor(
@@ -10248,9 +10252,7 @@ static ds4_gpu_tensor *metal_graph_comp_kv_for_attn(
             n_comp,
             DS4_N_HEAD_DIM,
             comp_row_bytes) == 0) {
-        /* Dequant failed - fall back to float pool which is still
-         * load-bearing until Phase 7.4 drops it. */
-        return g->layer_attn_comp_cache[il];
+        return g->comp_cache_dequant_scratch;  /* still valid pointer */
     }
     return g->comp_cache_dequant_scratch;
 }
@@ -12909,9 +12911,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 /* Phase 7.2: dual-write packed companion when comp_dtype=turbo3.
                  * Pack the float rows the compressor just wrote into the
-                 * packed pool.  Full-prefill path -> rows start at 0.
-                 * Reads from layer_attn_comp_cache_packed will be wired up
-                 * by Phase 7.3; the float pool stays load-bearing until 7.4. */
+                 * packed pool.  Full-prefill path -> rows start at 0. */
                 if (ok && g_ds4_comp_dtype == DS4_KV_TURBO3 &&
                     g->layer_attn_comp_cache_packed[il] != NULL && n_comp != 0) {
                     const uint64_t comp_row_bytes =
