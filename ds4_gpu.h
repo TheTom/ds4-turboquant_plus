@@ -261,7 +261,7 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
  * 3-bit Lloyd-Max codebook indices inside a 64-element Randomized Hadamard
  * rotation, then dequantizing back to the original basis.  Storage layout is
  * unchanged from the FP8 path so the surrounding cache write logic stays
- * identical — only the quantization error differs.  See ds4_kv_dtype in ds4.h
+ * identical - only the quantization error differs.  See ds4_kv_dtype in ds4.h
  * for the algorithm rationale and prior-art citation chain. */
 int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
         ds4_gpu_tensor *x,
@@ -297,7 +297,7 @@ int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
         uint64_t              src_row_bytes);
 
 /* Phase 2 ring-aware batch pack into the SWA cache.  Mirrors
- * ds4_gpu_store_raw_kv_batch_tensor (the fp8 path) — same `(pos0 + t) % raw_cap`
+ * ds4_gpu_store_raw_kv_batch_tensor (the fp8 path) - same `(pos0 + t) % raw_cap`
  * ring-write semantics but writes packed turbo3 bytes per row. */
 int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
         const ds4_gpu_tensor *src,
@@ -574,7 +574,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* Phase 2b turbo3 attention launchers — packed-byte raw cache.  Live
+/* Phase 2b turbo3 attention launchers - packed-byte raw cache.  Live
  * implementations in ds4_cuda.cu; Metal builds get stub returns in
  * ds4_metal.m (never reached since engine open rejects --kv-cache
  * turbo3 + --metal). */

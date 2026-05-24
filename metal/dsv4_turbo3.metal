@@ -6,7 +6,7 @@
 // codebook for N(0,1) + two-sided Rademacher signs for the 64-point WHT).
 //
 // Phase 2b Wave M0 (this file): primitive + pack/dequant kernels.  Attention
-// kernels with inline turbo3 dequant follow in Wave M2-M4 — they include
+// kernels with inline turbo3 dequant follow in Wave M2-M4 - they include
 // this file via #include "dsv4_turbo3.metal" or duplicate the inline
 // functions in their own .metal file.
 //
@@ -136,7 +136,7 @@ static inline void turbo3_dequant_group64(
     const float scale = turbo3_fp8_e4m3_value((int)scale_byte);
 
     // Pre-scaled centroid cache (per-block scaled-centroid hoist pattern
-    // from llama-cpp-turboquant — saves 64 muls per group).
+    // from llama-cpp-turboquant - saves 64 muls per group).
     float sc[8];
     for (int c = 0; c < 8; c++) sc[c] = DS4_TURBO3_CODEBOOK[c] * scale;
 
@@ -180,7 +180,7 @@ static inline float turbo3_load_unaligned_f32(device const uchar *p) {
     return as_type<float>(v);
 }
 
-// Phase 2 pack kernel — sibling of CUDA's turbo3_kv_pack_kernel.  Reads a
+// Phase 2 pack kernel - sibling of CUDA's turbo3_kv_pack_kernel.  Reads a
 // [n_tok, head_dim] float tensor (post-RoPE KV projection output) and writes
 // [n_tok * dst_row_bytes] packed bytes.  Grid: (n_tok, 1, 1) × tg(64,1,1).
 //
@@ -212,7 +212,7 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
         } else {
             for (int i = 0; i < 64; i++) buf[i] = gs[i];
         }
-        // WHT butterfly is self-inverse — same body for forward.
+        // WHT butterfly is self-inverse - same body for forward.
         turbo3_wht64_inplace(buf);
         for (int i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
         if (signs_on) {
@@ -272,7 +272,7 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
         dst_row[data_bytes + tid] = turbo3_fp8_e4m3_encode(scale);
     }
 
-    // RoPE tail copy — one thread handles 64 floats.
+    // RoPE tail copy - one thread handles 64 floats.
     if (tid == 0 && n_rot > 0) {
         const ulong scale_bytes = (ulong)n_groups;
         device uchar *rope_slot = dst_row + data_bytes + scale_bytes;
@@ -283,7 +283,7 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
     }
 }
 
-// Phase 2b Wave M2: ring-aware batched pack — sibling of CUDA's
+// Phase 2b Wave M2: ring-aware batched pack - sibling of CUDA's
 // turbo3_kv_pack_batch_kernel.  Each token writes into ring slot
 // (pos0 + t) % raw_cap.  Grid: (n_tokens, 1, 1) × tg(64, 1, 1).
 kernel void kernel_dsv4_turbo3_kv_pack_batch_f32(
@@ -376,12 +376,12 @@ kernel void kernel_dsv4_turbo3_kv_pack_batch_f32(
     }
 }
 
-// Phase 1 float-sim quantize kernel — sibling of CUDA's
+// Phase 1 float-sim quantize kernel - sibling of CUDA's
 // turbo3_kv_quantize_kernel.  Applies turbo3 quantization noise to a
 // float [n_tok, head_dim] tensor in place (used for comp_kv round
 // trips where attention kernels read comp_kv as floats but the values
 // must look like what turbo3 storage would dequant to).  No packing,
-// no storage change — input + output are both float.
+// no storage change - input + output are both float.
 //
 // 64 threads per row, one element per thread.  Uses 64-float
 // threadgroup scratch for the WHT butterfly + a second 64-float
@@ -409,7 +409,7 @@ kernel void kernel_dsv4_turbo3_kv_quantize_f32(
 
         // Forward WHT in threadgroup memory.  Match CUDA wht64_block exactly:
         // low thread (lower index of pair) writes (self + other);
-        // high thread writes (other - self) — NOT (self - other).
+        // high thread writes (other - self) - NOT (self - other).
         for (int stride = 1; stride < 64; stride <<= 1) {
             const uint pair = tid ^ stride;
             const float self_v = buf[tid];
@@ -490,7 +490,7 @@ kernel void kernel_dsv4_turbo3_kv_quantize_f32(
     }
 }
 
-// Phase 2 dequant-to-scratch kernel — sibling of CUDA's
+// Phase 2 dequant-to-scratch kernel - sibling of CUDA's
 // turbo3_kv_dequant_to_scratch_kernel.  Reads `n_rows` packed turbo3 rows
 // from `src` (each `src_row_bytes` long) and writes original-basis floats
 // into `dst` at the natural [n_rows, head_dim] float layout.  Grid:

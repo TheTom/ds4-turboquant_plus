@@ -39,7 +39,7 @@ ds4-bench: KV footprint @ ctx=16389:
 
 Reading the table:
 
-- **Prefill** is unchanged across all three — within 3% of fp8 baseline.
+- **Prefill** is unchanged across all three - within 3% of fp8 baseline.
 - **Gen_tps regresses ~13% on the packed-byte path** vs fp8 baseline.  The
   per-attention-call dequant-to-scratch kernel launch is the cost driver
   (~0.25 ms per decode-layer in the linear-attention pass).

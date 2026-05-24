@@ -1685,13 +1685,13 @@ static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, ui
  *      per-coordinate distribution (Lindeberg-CLT) so a fixed Lloyd-Max codebook
  *      for N(0,1) attains near-MSE-optimal distortion regardless of the input
  *      activation distribution.  Both sign tables seed=42 / seed=142 from
- *      Pythons random.Random with Bernoulli(0.5) — deterministic and documented
+ *      Pythons random.Random with Bernoulli(0.5) - deterministic and documented
  *      below.
  *   2. Per-group amax → scale = TURBO3_MAX / amax (so |scaled value| <= MAX).
  *   3. 3-bit Lloyd-Max quant (8 levels) for N(0,1), nearest-centroid index 0..7.
  *   4. Matched-norm L2 correction: replace the amax scale with
  *      ||original|| / ||centroid_recon|| so the dequantized group has the same
- *      L2 norm as the input — frees ~0.5% PPL on average vs amax-only.  We
+ *      L2 norm as the input - frees ~0.5% PPL on average vs amax-only.  We
  *      clamp the scale to the FP8 E4M3 representable range so that a future
  *      Metal port that stores the scale as packed FP8 stays bit-equivalent.
  *   5. Lookup dequantized centroid * matched-norm scale.
@@ -1703,7 +1703,7 @@ static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, ui
  * The diagnostic switch DS4_TURBO_NO_SIGNS=1 in the environment drops the
  * Rademacher masks (signs ≡ +1).  Plain WHT is strictly weaker than the
  * canonical Randomized Hadamard form and is provided only for A/B testing the
- * sign contribution to PPL — do not run as the release path.
+ * sign contribution to PPL - do not run as the release path.
  *
  * Prior art chain: Google TurboQuant (arXiv:2504.19874, ICLR 2026) → TheTom/
  * turboquant_plus umbrella → TheTom/llama-cpp-turboquant engine reference.  The
@@ -1732,12 +1732,12 @@ static const float DS4_TURBO3_BOUNDS[7] = {
  * random.Random(seed) with Bernoulli(0.5) → {-1,+1}; documented in
  * gguf-tools/quality-testing/README.md for reproducibility.  Same canonical
  * approach as the 128/256/512 tables vendored into TheTom/llama-cpp-turboquant
- * and Atlas's tq_plus_signs.cuh — only the length and seed differ, picked here
+ * and Atlas's tq_plus_signs.cuh - only the length and seed differ, picked here
  * to match ds4's natural per-group cadence of 64.
  *
  * Why these arrays are static const float (not __device__ __constant__): the
  * CPU reference path uses them directly.  The CUDA kernel (ds4_cuda.cu) re-
- * emits identical tables as __device__ __constant__ at file scope — the two
+ * emits identical tables as __device__ __constant__ at file scope - the two
  * sources are kept byte-equivalent by inspection and verified by the unit test
  * that compares CPU vs GPU round-trip on a fixed seed. */
 static const float DS4_TURBO_SIGNS1_64[64] = {
@@ -1814,7 +1814,7 @@ static void dsv4_turbo3_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim,
         }
         dsv4_turbo3_wht64_inplace_cpu(buf);
         /* WHT normalization 1/sqrt(64).  Cast the 64 to float so the divide is
-         * unambiguously float-by-float — clang-tidy bugprone-integer-division
+         * unambiguously float-by-float - clang-tidy bugprone-integer-division
          * has been noisy on the literal form in other parts of the tree. */
         const float inv_sqrt_n = 1.0f / sqrtf(64.0f);
         for (uint32_t i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
@@ -1874,7 +1874,7 @@ static void dsv4_turbo3_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim,
  * `pack_group64`: take 64 floats (already WHT-rotated in the group basis),
  *  matched-norm L2 quantize them, write 24 bytes packed data + 1 FP8 scale.
  *
- * `unpack_group64`: inverse — take 24 bytes + 1 FP8 scale, expand to 64
+ * `unpack_group64`: inverse - take 24 bytes + 1 FP8 scale, expand to 64
  *  rotated-basis floats (centroid * scale), then apply iWHT-with-signs to
  *  return values in the original basis.
  *
@@ -1933,7 +1933,7 @@ static float dsv4_turbo3_fp8_e4m3_to_float_cpu(unsigned char b) {
  * rotated:    the 64 floats in the rotated basis (already amax/norm-aware).
  *
  * The caller is responsible for having pre-rotated the input via the same
- * WHT+signs1+signs2 pipeline used in Phase 1 — see
+ * WHT+signs1+signs2 pipeline used in Phase 1 - see
  * dsv4_turbo3_kv_quantize_row_inplace_cpu for the canonical sequence.  We
  * pack here AFTER the rotation; the iWHT is applied on the read side. */
 static void dsv4_turbo3_pack_group64_cpu(
@@ -1996,7 +1996,7 @@ static void dsv4_turbo3_pack_group64_cpu(
  *   i4 = (b1 >> 4) & 7
  *   i5 = ((b1 >> 7) | (b2 << 1)) & 7
  *   i6 = (b2 >> 2) & 7
- *   i7 = (b2 >> 5) & 7   (top 3 bits — no overflow concern)
+ *   i7 = (b2 >> 5) & 7   (top 3 bits - no overflow concern)
  */
 static void dsv4_turbo3_unpack_group64_rotated_cpu(
         float               *out,
@@ -2111,7 +2111,7 @@ static DS4_MAYBE_UNUSED void dsv4_turbo3_kv_unpack_row_cpu(
 /* Active KV cache dtype.  Set once by ds4_engine_open from the parsed CLI flag
  * and read by the dispatch helper below.  File-scope so the seven existing
  * cache-store sites in this file (CPU prefill, CPU streaming-decode,
- * compressor-decode, MTP, restore, etc.) stay one line each — threading a
+ * compressor-decode, MTP, restore, etc.) stay one line each - threading a
  * dtype argument through the layer call chain would have touched dozens of
  * inner functions for no semantic gain.
  *
@@ -2133,13 +2133,13 @@ static void ds4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_
 }
 
 #ifndef DS4_NO_GPU
-/* GPU dispatchers — same dtype-based pick, but for the CUDA tensor helpers.
+/* GPU dispatchers - same dtype-based pick, but for the CUDA tensor helpers.
  * Sites in this file call these instead of the raw fp8 wrappers so a single
  * dtype enum decides which kernel runs.
  *
  * Phase 2 turbo3 path: `_quantize_tensor_dispatch` still runs the float-sim
  * round trip on `x` (kept for sites that mutate the KV tensor in place but
- * then write it to a NON-raw_cache destination — e.g. the compressor pool).
+ * then write it to a NON-raw_cache destination - e.g. the compressor pool).
  * Sites that store into the per-layer raw_cache go through the new
  * `_packed_store_raw_tensor` path below which writes packed bytes directly
  * via the pack kernel. */
@@ -2186,7 +2186,7 @@ static int ds4_gpu_kv_store_raw_batch_tensor_dispatch(
  * caller-provided `scratch` (raw_cap * head_dim floats) and returns
  * `scratch`.  Callers that share one scratch across multiple attention
  * calls in the same layer can amortize the dequant by caching the result
- * for the layer/pos pair — see `metal_graph_encode_decode_layer` for the
+ * for the layer/pos pair - see `metal_graph_encode_decode_layer` for the
  * one-shot-per-layer pattern.  Returns NULL if a dequant launch fails. */
 static ds4_gpu_tensor *ds4_gpu_kv_attention_view_dispatch(
         ds4_gpu_tensor *raw_cache, ds4_gpu_tensor *scratch,
@@ -2210,7 +2210,7 @@ static ds4_gpu_tensor *ds4_gpu_kv_attention_view_dispatch(
  *   bytes, repeated 8 times -> 24 = 8*3) and one FP8 E4M3 scale byte.  The
  *   rope tail is appended as raw little-endian floats at the end of the row.
  *
- * Always returns >= head_dim*4 for fp8 and the packed total for turbo3 — no
+ * Always returns >= head_dim*4 for fp8 and the packed total for turbo3 - no
  * padding.  Callers that need alignment add it themselves. */
 uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype) {
     if (head_dim <= n_rot) {
@@ -5341,7 +5341,7 @@ static void layer_kv_projection_normed_one_decode_scratch(
 }
 
 static float rope_yarn_ramp(float low, float high, int i0) {
-    /* (float)i0 / 2.0f, not (float)(i0/2) — keep the divide in float so we
+    /* (float)i0 / 2.0f, not (float)(i0/2) - keep the divide in float so we
      * preserve sub-2 RoPE fractional dims and silence clang-tidy
      * bugprone-integer-division. */
     const float y = ((float)i0 / 2.0f - low) / fmaxf(0.001f, high - low);
@@ -8788,7 +8788,7 @@ typedef struct {
 
     /* Phase 2 turbo3 dequant scratch.  When the active dtype is DS4_KV_TURBO3
      * the layer_raw_cache buffers are sized as packed bytes (~431 B/row vs
-     * 2048 B/row for fp8) — the existing attention kernels can't read them
+     * 2048 B/row for fp8) - the existing attention kernels can't read them
      * directly.  Before each attention dispatch the per-graph dequant kernel
      * unpacks raw_cap rows from layer_raw_cache[il] into this scratch tensor,
      * and the attention kernel reads the scratch as it always did.  For fp8
@@ -8798,7 +8798,7 @@ typedef struct {
      * (a ~9.6 MB shrink on the SWA ring at raw_cap=128, DS4_N_LAYER=43); per-
      * attention-call dequant pass adds ~5 us at decode T=1 (negligible on
      * GB10).  The bandwidth win from reading packed bytes vs floats does NOT
-     * materialize at the attention V-load layer in this scheme — see
+     * materialize at the attention V-load layer in this scheme - see
      * docs/turbo3-roadmap.md "Phase 2b" for the inline-dequant follow-up that
      * gets the V-load bandwidth win at the cost of ~600 LoC of CUDA kernel
      * rewrites across 12 attention kernels. */
@@ -10260,7 +10260,7 @@ static bool metal_graph_encode_decode_layer(
      *
      * Phase 2b: kernels with inline-dequant siblings (currently the
      * decode_heads simple path via attention_decode_mixed_turbo3_kernel)
-     * read packed bytes directly — no view_dispatch hop needed.
+     * read packed bytes directly - no view_dispatch hop needed.
      * Kernels without an inline-dequant sibling yet (indexed_mixed)
      * still go through view_dispatch which dequants into the per-graph
      * scratch float tensor.
@@ -10572,7 +10572,7 @@ static bool metal_graph_encode_decode_layer(
             /* Indexed mixed path.  Phase 2b Wave 1.3 ships an inline-dequant
              * turbo3 sibling for the n_tokens=1 fallback kernel (covers
              * decode-token, the hot path).  heads8_online / rb4 paths still
-             * need float — fall back to view_dispatch when the turbo3
+             * need float - fall back to view_dispatch when the turbo3
              * launcher returns 0. */
             int turbo3_rc = 0;
             if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
@@ -10638,7 +10638,7 @@ static bool metal_graph_encode_decode_layer(
             }
         } else if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
             /* Phase 2b Wave 1.2: decode_heads has an inline-dequant
-             * turbo3 sibling — pass packed bytes directly, no
+             * turbo3 sibling - pass packed bytes directly, no
              * view_dispatch dequant. */
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO3);
             int rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
@@ -10655,7 +10655,7 @@ static bool metal_graph_encode_decode_layer(
                     0,
                     DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
             if (rc == 0) {
-                /* Turbo3 launcher rejected — fall back via dequant + float kernel. */
+                /* Turbo3 launcher rejected - fall back via dequant + float kernel. */
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
                         raw_cache, dequant_scratch,
                         raw_cap, DS4_N_HEAD_DIM, DS4_N_ROT);
@@ -16990,7 +16990,7 @@ struct ds4_session {
  * Backward compat: a v2 reader that sees a v1 file falls back to the v1
  * header read (13 fields) and assumes kv_dtype = DS4_KV_FP8.  A v1 reader
  * sees a v2 file as "unsupported session payload version" and refuses to
- * load — caller can retry with a fresh prompt.
+ * load - caller can retry with a fresh prompt.
  *
  * Cross-dtype reject: v2 reader compares the saved kv_dtype against the
  * active engine dtype.  Mismatch -> clear error message; user has to either

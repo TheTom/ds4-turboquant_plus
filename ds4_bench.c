@@ -454,7 +454,7 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
     const double raw_ratio = (t3.raw_bytes > 0)
             ? ((double)fp8.raw_bytes / (double)t3.raw_bytes) : 0.0;
     /* Print the SWA ring (the only pool that swaps to packed bytes in Phase
-     * 2a) plus the compressed pools (kept float / F16 — see roadmap). */
+     * 2a) plus the compressed pools (kept float / F16 - see roadmap). */
     fprintf(stderr,
             "ds4-bench: KV footprint @ ctx=%d:\n"
             "  fp8     raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"

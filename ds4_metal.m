@@ -6535,10 +6535,10 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return 1;
 }
 
-/* TurboQuant+ 3-bit KV round trip — not yet implemented on Metal.
+/* TurboQuant+ 3-bit KV round trip - not yet implemented on Metal.
  *
  * The CUDA port lives in ds4_cuda.cu (turbo3_kv_quantize_kernel).  Metal is the
- * production target per AGENT.md but the kernel hasn't been written yet — this
+ * production target per AGENT.md but the kernel hasn't been written yet - this
  * stub returns 0 and prints a one-line diagnostic so callers fail fast.  The
  * engine-open guard in ds4.c rejects --kv-cache turbo3 on the Metal backend so
  * users never reach this call site at runtime; the symbol exists only to keep
@@ -6611,7 +6611,7 @@ int ds4_gpu_kv_turbo3_store_raw_tensor(
     return 0;
 }
 
-/* Phase 2b Wave M1: turbo3 sym pack — single-row + multi-row, no ring.
+/* Phase 2b Wave M1: turbo3 sym pack - single-row + multi-row, no ring.
  * Mirrors CUDA's turbo3_kv_pack_kernel.  Dispatched as one threadgroup
  * per row, 64 threads per group (one per 64-elem group + RoPE-tail thread). */
 int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
@@ -6693,7 +6693,7 @@ int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
 }
 
 /* Phase 2b Wave M2: ring-aware batched pack.  Sibling of CUDA's
- * turbo3_kv_pack_batch_kernel — writes each token's packed bytes to
+ * turbo3_kv_pack_batch_kernel - writes each token's packed bytes to
  * raw cache ring slot (pos0 + t) % raw_cap. */
 int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
         const ds4_gpu_tensor *src,
@@ -6738,7 +6738,7 @@ int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
     return 1;
 }
 
-/* Phase 2b turbo3 attention launchers — Metal stubs.  The engine open
+/* Phase 2b turbo3 attention launchers - Metal stubs.  The engine open
  * guard in ds4.c rejects --kv-cache turbo3 + --metal so these never run,
  * but the linker needs the symbols since the call sites in ds4.c are
  * compiled-in regardless of backend. */

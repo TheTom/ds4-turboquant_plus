@@ -23,12 +23,12 @@ typedef enum {
 /* KV cache compression dtype selection.
  *
  * DS4_KV_FP8 (default): the historical path.  The non-RoPE part of each compressed
- * KV row goes through an in-place E4M3 round trip in groups of 64 — values stay as
+ * KV row goes through an in-place E4M3 round trip in groups of 64 - values stay as
  * float32 in memory but pick up the FP8 quantization error so the CPU reference
  * matches what the Metal graph would store as packed FP8.  No layout change.
  *
  * DS4_KV_TURBO3: TurboQuant+ port from TheTom/llama-cpp-turboquant.  Storage layout
- * is packed 3-bit Lloyd-Max indices + per-group FP8 scale bytes (Phase 2) — the
+ * is packed 3-bit Lloyd-Max indices + per-group FP8 scale bytes (Phase 2) - the
  * cache buffer is byte-addressed at `row * ds4_kv_row_bytes(head_dim, n_rot, ...)`,
  * NOT float-addressed at `row * head_dim`.  Every attention kernel inline-dequants
  * the packed bytes on V-load.  The Randomized Hadamard rotation + N(0,1) Lloyd-Max
@@ -47,7 +47,7 @@ typedef enum {
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
 
-/* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 — the same WHT
+/* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 - the same WHT
  * group cadence used by the Phase 1 float-sim quantizer; one matched-norm L2
  * scale per 64 elements.  See the Phase 1 comment block in ds4.c
  * (`dsv4_turbo3_kv_quantize_row_inplace_cpu`) for the per-group algorithm.
@@ -69,7 +69,7 @@ int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
  * group for ~25x less memory traffic vs the fp8 float-sim cache.  The
  * advantage is that every existing reader (attention dot loops, compressor
  * pool, disk save, MTP draft) sees the same original-basis values it did
- * before — only the storage byte layout changes. */
+ * before - only the storage byte layout changes. */
 #define DS4_TURBO3_GROUP_SIZE 64u
 uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype);
 
