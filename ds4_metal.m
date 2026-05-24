@@ -6460,6 +6460,36 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return 1;
 }
 
+/* TurboQuant+ 3-bit KV round trip — not yet implemented on Metal.
+ *
+ * The CUDA port lives in ds4_cuda.cu (turbo3_kv_quantize_kernel).  Metal is the
+ * production target per AGENT.md but the kernel hasn't been written yet — this
+ * stub returns 0 and prints a one-line diagnostic so callers fail fast.  The
+ * engine-open guard in ds4.c rejects --kv-cache turbo3 on the Metal backend so
+ * users never reach this call site at runtime; the symbol exists only to keep
+ * the unified link surface defined on the Metal build. */
+int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot) {
+    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
+    fprintf(stderr, "ds4: --kv-cache turbo3 is CUDA-only in this build; Metal port deferred\n");
+    return 0;
+}
+
+int ds4_gpu_kv_turbo3_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          row,
+        uint32_t          head_dim,
+        uint32_t          n_rot) {
+    (void)kv; (void)raw_cache; (void)raw_cap; (void)row; (void)head_dim; (void)n_rot;
+    fprintf(stderr, "ds4: --kv-cache turbo3 is CUDA-only in this build; Metal port deferred\n");
+    return 0;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
