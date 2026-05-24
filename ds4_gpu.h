@@ -269,6 +269,46 @@ int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Phase 2 packed-byte pack kernel.  Reads a [n_tok, head_dim] float tensor
+ * (the post-RoPE KV projection output) and writes the turbo3 packed bytes
+ * into `dst` at `n_tok * dst_row_bytes` total bytes.  `dst_row_bytes` must
+ * equal `ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3)`. */
+int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_tok,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              dst_row_bytes);
+
+/* Phase 2 decompress-to-scratch entry point.  Reads `n_rows` packed turbo3
+ * rows from `src` (each `src_row_bytes` long) and writes original-basis
+ * floats into `dst` at the natural `[n_rows, head_dim]` float layout that
+ * the existing attention kernels expect.  Called before each attention
+ * dispatch when the active dtype is DS4_KV_TURBO3 so the attention kernels
+ * can read floats unchanged.  Phase 2b would inline this dequant into each
+ * attention kernel directly to capture the V-load bandwidth win. */
+int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes);
+
+/* Phase 2 ring-aware batch pack into the SWA cache.  Mirrors
+ * ds4_gpu_store_raw_kv_batch_tensor (the fp8 path) — same `(pos0 + t) % raw_cap`
+ * ring-write semantics but writes packed turbo3 bytes per row. */
+int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
