@@ -71,7 +71,7 @@ static void usage(FILE *fp) {
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
-        "  --kv-cache fp8|turbo3|turbo4  KV cache compression. Default: fp8 (historical path).\n"
+        "  --kv-cache fp8|turbo3|turbo4|turbo2  KV cache compression. Default: fp8.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -410,15 +410,18 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
     const ds4_kv_footprint fp8 = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_FP8);
     const ds4_kv_footprint t3  = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_TURBO3);
     const ds4_kv_footprint t4  = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_TURBO4);
+    const ds4_kv_footprint t2  = ds4_kv_footprint_estimate(backend, ctx_size, DS4_KV_TURBO2);
     const double mib = 1.0 / (1024.0 * 1024.0);
     const double raw_ratio3 = (t3.raw_bytes > 0) ? ((double)fp8.raw_bytes / (double)t3.raw_bytes) : 0.0;
     const double raw_ratio4 = (t4.raw_bytes > 0) ? ((double)fp8.raw_bytes / (double)t4.raw_bytes) : 0.0;
+    const double raw_ratio2 = (t2.raw_bytes > 0) ? ((double)fp8.raw_bytes / (double)t2.raw_bytes) : 0.0;
     fprintf(stderr,
             "ds4-bench: KV footprint @ ctx=%d:\n"
             "  fp8     raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
             "  turbo3  raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
             "  turbo4  raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
-            "  raw shrink: turbo3 %.2fx, turbo4 %.2fx\n",
+            "  turbo2  raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
+            "  raw shrink: turbo3 %.2fx, turbo4 %.2fx, turbo2 %.2fx\n",
             ctx_size,
             (double)fp8.raw_bytes * mib,
             (double)fp8.compressed_bytes * mib,
@@ -432,7 +435,11 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
             (double)t4.compressed_bytes * mib,
             (double)t4.total_bytes * mib,
             active == DS4_KV_TURBO4 ? "  <-- active" : "",
-            raw_ratio3, raw_ratio4);
+            (double)t2.raw_bytes * mib,
+            (double)t2.compressed_bytes * mib,
+            (double)t2.total_bytes * mib,
+            active == DS4_KV_TURBO2 ? "  <-- active" : "",
+            raw_ratio3, raw_ratio4, raw_ratio2);
 }
 
 int main(int argc, char **argv) {

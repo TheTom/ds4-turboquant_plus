@@ -93,6 +93,10 @@ static id<MTLComputePipelineState> g_dsv4_turbo4_kv_pack_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo4_kv_pack_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo4_kv_dequant_to_scratch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_attention_decode_mixed_turbo4_pipeline;
+/* turbo2 siblings — 2-bit Lloyd-Max ultra-compression.  No inline-dequant
+ * attention kernel; always uses M1 dequant-to-scratch fallback. */
+static id<MTLComputePipelineState> g_dsv4_turbo2_kv_pack_batch_pipeline;
+static id<MTLComputePipelineState> g_dsv4_turbo2_kv_dequant_to_scratch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
@@ -3326,6 +3330,8 @@ int ds4_gpu_init(void) {
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo4_kv_pack_batch_f32",          g_dsv4_turbo4_kv_pack_batch_pipeline);
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo4_kv_dequant_to_scratch_f32",  g_dsv4_turbo4_kv_dequant_to_scratch_pipeline);
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_mixed_turbo4_f32", g_dsv4_attention_decode_mixed_turbo4_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo2_kv_pack_batch_f32",          g_dsv4_turbo2_kv_pack_batch_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo2_kv_dequant_to_scratch_f32",  g_dsv4_turbo2_kv_dequant_to_scratch_pipeline);
         #undef DS4_LOAD_T4_PIPELINE
 
         fn = [library newFunctionWithName:@"kernel_dsv4_indexer_hadamard_fp4_f32"];
@@ -4593,6 +4599,8 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_turbo4_kv_pack_batch_pipeline = nil;
         g_dsv4_turbo4_kv_dequant_to_scratch_pipeline = nil;
         g_dsv4_attention_decode_mixed_turbo4_pipeline = nil;
+        g_dsv4_turbo2_kv_pack_batch_pipeline = nil;
+        g_dsv4_turbo2_kv_dequant_to_scratch_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
@@ -7375,6 +7383,100 @@ int ds4_gpu_attention_prefill_raw_turbo4_heads_tensor(
     (void)raw_kv_bytes; (void)row_bytes; (void)n_tokens; (void)window;
     (void)n_head; (void)head_dim; (void)n_rot;
     return 0;
+}
+
+/* =========================================================================
+ * turbo2 (2-bit Lloyd-Max) launchers — opt-in ultra-compression.
+ * No inline-dequant attention kernel; always uses M1 dequant-to-scratch
+ * fallback + the existing fp8 attention kernels.  Quantize delegates to
+ * the FP8 fallback (same reason as turbo3/4 in-place quant).
+ * ========================================================================= */
+
+int ds4_gpu_dsv4_turbo2_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot) {
+    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
+}
+
+int ds4_gpu_dsv4_turbo2_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!src || !dst || n_rows == 0 || n_rot > head_dim) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)src);
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
+        if (!sbuf || !dbuf) return 0;
+        if (ds4_gpu_tensor_bytes(src) < (uint64_t)n_rows * src_row_bytes) return 0;
+        if (ds4_gpu_tensor_bytes(dst) < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo2_kv_dequant_to_scratch_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(dst) atIndex:1];
+        [enc setBytes:&n_rows        length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&head_dim      length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n_rot         length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&src_row_bytes length:sizeof(uint64_t) atIndex:5];
+        [enc setBytes:&signs_on      length:sizeof(int)      atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo2 KV dequant")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!src || !raw || raw_cap == 0 || n_rot > head_dim) return 0;
+    if (n_tokens == 0) return 1;
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)src);
+        id<MTLBuffer> rbuf = ds4_gpu_tensor_buffer(raw);
+        if (!sbuf || !rbuf) return 0;
+        if (ds4_gpu_tensor_bytes(src) < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+        if (ds4_gpu_tensor_bytes(raw) < (uint64_t)raw_cap * row_bytes) return 0;
+
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo2_kv_pack_batch_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:rbuf offset:ds4_gpu_tensor_offset(raw) atIndex:1];
+        [enc setBytes:&raw_cap   length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&pos0      length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n_tokens  length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&head_dim  length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&n_rot     length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&row_bytes length:sizeof(uint64_t) atIndex:7];
+        [enc setBytes:&signs_on  length:sizeof(int)      atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo2 KV pack batch")) return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_dsv4_indexer_qat_tensor(

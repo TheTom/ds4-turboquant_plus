@@ -344,6 +344,33 @@ int ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
         uint32_t              n_rot,
         uint64_t              row_bytes);
 
+/* turbo2 (2-bit Lloyd-Max) entry points.  Opt-in ultra-compression
+ * variant — no inline-dequant attention kernel, always falls back to
+ * dequant-to-scratch + the existing fp8 attention kernels. */
+int ds4_gpu_dsv4_turbo2_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+int ds4_gpu_dsv4_turbo2_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes);
+
+int ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,

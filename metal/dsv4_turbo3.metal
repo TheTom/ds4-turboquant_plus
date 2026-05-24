@@ -1202,3 +1202,183 @@ kernel void kernel_dsv4_attention_decode_mixed_turbo4_f32(
     oh[d0] = acc0 / denom;
     oh[d1] = acc1 / denom;
 }
+
+// =========================================================================
+// turbo2 — 2-bit Lloyd-Max codebook, 16 B / 64-element group, 4 codes/byte
+// =========================================================================
+//
+// Storage per row (head_dim=512, n_rot=64, n_nope=448, n_groups=7):
+//   data:   n_nope * 2 / 8 = 112 B (7 groups × 16 B)
+//   scales: 7 B
+//   rope:   256 B
+//   total:  375 B / row  (vs 2048 fp8, 431 turbo3, 487 turbo4)
+//
+// Compression: 2048/375 = 5.46x vs fp8 (15% more than turbo3).  Quality
+// inverted: Lloyd-Max MSE 0.117 vs turbo3 0.0345 vs turbo4 0.0095.
+// Use only when SWA memory pressure outweighs the quality regression.
+//
+// No inline-dequant attention kernel — turbo2 always uses the M1
+// dequant-to-scratch + fp8 attention path.  Shares signs, WHT, FP8
+// helpers, unaligned load with turbo3/4.
+
+#define DS4_TURBO2_DATA_BYTES_PER_GROUP 16u
+#define DS4_TURBO2_MAX_D                1.5104f
+
+constant float DS4_TURBO2_CODEBOOK[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f
+};
+
+constant float DS4_TURBO2_BOUNDS[3] = {
+    -0.9816f, 0.0f, 0.9816f
+};
+
+static inline void turbo2_dequant_group64(
+        thread float        out64[64],
+        device const uchar *row_base,
+        uint                group_idx,
+        uint                n_nope,
+        int                 signs_on) {
+    device const uchar *data_slot = row_base + group_idx * DS4_TURBO2_DATA_BYTES_PER_GROUP;
+    const uint  data_bytes  = n_nope / 4u;
+    const uchar scale_byte  = row_base[data_bytes + group_idx];
+    const float scale = turbo3_fp8_e4m3_value((int)scale_byte);
+
+    float sc[4];
+    for (int c = 0; c < 4; c++) sc[c] = DS4_TURBO2_CODEBOOK[c] * scale;
+
+    // 4 codes per byte (2 bits each).  Unpack 16 bytes -> 64 floats.
+    for (int i = 0; i < 16; i++) {
+        const uint b = data_slot[i];
+        out64[4*i + 0] = sc[(b)      & 0x3u];
+        out64[4*i + 1] = sc[(b >> 2) & 0x3u];
+        out64[4*i + 2] = sc[(b >> 4) & 0x3u];
+        out64[4*i + 3] = sc[(b >> 6) & 0x3u];
+    }
+
+    if (signs_on) {
+        for (int i = 0; i < 64; i++) out64[i] *= DS4_TURBO_SIGNS2_64[i];
+    }
+    turbo3_wht64_inplace(out64);
+    const float inv_sqrt_n = rsqrt(64.0f);
+    for (int i = 0; i < 64; i++) out64[i] *= inv_sqrt_n;
+    if (signs_on) {
+        for (int i = 0; i < 64; i++) out64[i] *= DS4_TURBO_SIGNS1_64[i];
+    }
+}
+
+static inline uchar turbo2_quant_idx(float v) {
+    if (v >= DS4_TURBO2_BOUNDS[1]) return (v >= DS4_TURBO2_BOUNDS[2]) ? 3u : 2u;
+    return (v >= DS4_TURBO2_BOUNDS[0]) ? 1u : 0u;
+}
+
+kernel void kernel_dsv4_turbo2_kv_pack_batch_f32(
+        device const float *src              [[ buffer(0) ]],
+        device       uchar *raw              [[ buffer(1) ]],
+        constant     uint  &raw_cap          [[ buffer(2) ]],
+        constant     uint  &pos0             [[ buffer(3) ]],
+        constant     uint  &n_tokens         [[ buffer(4) ]],
+        constant     uint  &head_dim         [[ buffer(5) ]],
+        constant     uint  &n_rot            [[ buffer(6) ]],
+        constant     ulong &row_bytes        [[ buffer(7) ]],
+        constant     int   &signs_on         [[ buffer(8) ]],
+        uint                t                [[ threadgroup_position_in_grid ]],
+        uint                tid              [[ thread_position_in_threadgroup ]]) {
+    if (t >= n_tokens) return;
+    const uint  n_nope    = head_dim - n_rot;
+    const uint  n_groups  = n_nope / DS4_TURBO3_GROUP_SIZE;
+    const uint  ring_row  = (pos0 + t) % raw_cap;
+    device const float *src_row = src + t * head_dim;
+    device       uchar *dst_row = raw + ring_row * row_bytes;
+    const ulong data_bytes = (ulong)n_nope / 4u;
+    const float inv_sqrt_n = rsqrt(64.0f);
+
+    if (tid < n_groups) {
+        float buf[64];
+        device const float *gs = src_row + tid * DS4_TURBO3_GROUP_SIZE;
+        if (signs_on) {
+            for (int i = 0; i < 64; i++) buf[i] = gs[i] * DS4_TURBO_SIGNS1_64[i];
+        } else {
+            for (int i = 0; i < 64; i++) buf[i] = gs[i];
+        }
+        turbo3_wht64_inplace(buf);
+        for (int i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (int i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+
+        float amax = 0.0f, norm_sq = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            const float v = buf[i];
+            const float av = fabs(v);
+            if (av > amax) amax = av;
+            norm_sq += v * v;
+        }
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO2_MAX_D / amax) : 1.0f;
+
+        uchar idx[64];
+        float recon_sq = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            const uchar code = turbo2_quant_idx(buf[i] * k_inv);
+            idx[i] = code;
+            const float c = DS4_TURBO2_CODEBOOK[code];
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrt(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrt(norm_sq) / recon_norm)
+                                            : (amax / DS4_TURBO2_MAX_D);
+        if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+        if (scale < 0.0f) scale = 0.0f;
+
+        device uchar *data_slot = dst_row + tid * DS4_TURBO2_DATA_BYTES_PER_GROUP;
+        for (int i = 0; i < 16; i++) {
+            data_slot[i] = (uchar)(((uint)idx[4*i]     & 0x3u)        |
+                                   (((uint)idx[4*i + 1] & 0x3u) << 2) |
+                                   (((uint)idx[4*i + 2] & 0x3u) << 4) |
+                                   (((uint)idx[4*i + 3] & 0x3u) << 6));
+        }
+        dst_row[data_bytes + tid] = turbo3_fp8_e4m3_encode(scale);
+    }
+
+    if (tid == 0 && n_rot > 0) {
+        const ulong scale_bytes = (ulong)n_groups;
+        device uchar *rope_slot = dst_row + data_bytes + scale_bytes;
+        device const uchar *src_tail = (device const uchar *)(src_row + n_nope);
+        for (uint i = 0; i < (uint)n_rot * sizeof(float); i++) {
+            rope_slot[i] = src_tail[i];
+        }
+    }
+}
+
+kernel void kernel_dsv4_turbo2_kv_dequant_to_scratch_f32(
+        device const uchar *src              [[ buffer(0) ]],
+        device       float *dst              [[ buffer(1) ]],
+        constant     uint  &n_rows           [[ buffer(2) ]],
+        constant     uint  &head_dim         [[ buffer(3) ]],
+        constant     uint  &n_rot            [[ buffer(4) ]],
+        constant     ulong &src_row_bytes    [[ buffer(5) ]],
+        constant     int   &signs_on         [[ buffer(6) ]],
+        uint                row              [[ threadgroup_position_in_grid ]],
+        uint                tid              [[ thread_position_in_threadgroup ]]) {
+    if (row >= n_rows) return;
+    const uint  n_nope   = head_dim - n_rot;
+    const uint  n_groups = n_nope / DS4_TURBO3_GROUP_SIZE;
+    device const uchar *src_row = src + row * src_row_bytes;
+    device       float *dst_row = dst + row * head_dim;
+
+    if (tid < n_groups) {
+        float buf[64];
+        turbo2_dequant_group64(buf, src_row, tid, n_nope, signs_on);
+        device float *gd = dst_row + tid * DS4_TURBO3_GROUP_SIZE;
+        for (int i = 0; i < 64; i++) gd[i] = buf[i];
+    }
+
+    if (tid == 0 && n_rot > 0) {
+        const ulong data_bytes  = (ulong)n_nope / 4u;
+        const ulong scale_bytes = (ulong)n_groups;
+        device const uchar *rope_slot = src_row + data_bytes + scale_bytes;
+        device uchar *dst_tail = (device uchar *)(dst_row + n_nope);
+        for (uint i = 0; i < (uint)n_rot * sizeof(float); i++) {
+            dst_tail[i] = rope_slot[i];
+        }
+    }
+}

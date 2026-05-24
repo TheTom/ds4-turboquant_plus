@@ -106,14 +106,18 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --kv-cache fp8|turbo3|turbo4\n"
-        "      KV cache compression. fp8 (default) keeps the historical E4M3 in-place\n"
-        "      round trip on the non-RoPE part of each compressed KV row. turbo3 swaps in\n"
-        "      a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max quantization\n"
-        "      (4.75x packed-byte shrink on the SWA raw cache). turbo4 uses the same shape\n"
-        "      with a 4-bit Lloyd-Max codebook (4.21x shrink, ~3.6x lower quantization\n"
-        "      noise -- pick when turbo3's quality regression is too large). All three\n"
-        "      work on CUDA + Metal.\n"
+        "  --kv-cache fp8|turbo3|turbo4|turbo2\n"
+        "      KV cache compression on the SWA raw cache.  fp8 (default) keeps the\n"
+        "      historical E4M3 in-place round trip on the non-RoPE part of each row.\n"
+        "      TurboQuant+ variants apply a Randomized Hadamard rotation + Lloyd-Max\n"
+        "      quantization per 64-element group with a matched-norm L2 scale.\n"
+        "        turbo3 -- 3-bit codebook, 4.75x raw shrink, MSE 0.0345\n"
+        "        turbo4 -- 4-bit codebook, 4.21x raw shrink, MSE 0.0095 (~3.6x lower\n"
+        "                  noise than turbo3; pick when quality matters more than the\n"
+        "                  last 13%% of bytes)\n"
+        "        turbo2 -- 2-bit codebook, 5.46x raw shrink, MSE 0.117 (opt-in ultra\n"
+        "                  compression; quality regression is real)\n"
+        "      All four work on CUDA + Metal.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1464,7 +1468,7 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--kv-cache")) {
             const char *kv_name = need_arg(&i, argc, argv, arg);
             if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
-                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
+                fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8, turbo3, turbo4 or turbo2)\n", kv_name);
                 exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {

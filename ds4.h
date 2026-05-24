@@ -51,6 +51,13 @@ typedef enum {
      * turbo3's quality regression is too large but >4× KV memory savings
      * are still desirable. */
     DS4_KV_TURBO4 = 2,
+    /* DS4_KV_TURBO2: 2-bit (4-level) Lloyd-Max variant for "ultra
+     * compression" — 16 B data per 64-element group, 375 B/row on
+     * DSV4's head_dim=512, n_rot=64.  5.46x raw shrink vs fp8.  Lloyd-
+     * Max MSE 0.117 on N(0,1) — 12x worse than turbo4 and 3x worse than
+     * turbo3, so quality drops noticeably; opt in only when SWA ring
+     * memory pressure outweighs quality. */
+    DS4_KV_TURBO2 = 3,
 } ds4_kv_dtype;
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
