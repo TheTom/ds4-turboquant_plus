@@ -40,6 +40,12 @@ typedef struct {
     bool quality;
     /* KV cache compression simulation; fp8 is the historical default. */
     ds4_kv_dtype kv_dtype;
+    /* PPL teacher-forced quality measurement.  When set, skips the
+     * throughput sweep and instead tokenizes the file, walks token by
+     * token, accumulates -log P(token_t | tokens_<t), and prints
+     * nll_avg / ppl / scored_tokens. */
+    const char *ppl_prompt_path;
+    int          ppl_max_tokens;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -87,6 +93,13 @@ static void usage(FILE *fp) {
         "  --csv FILE             Write CSV there instead of stdout.\n"
         "  --dump-frontier-logits-dir DIR\n"
         "      Write one full-logit JSON file per measured frontier. DIR must exist.\n"
+        "\n"
+        "Quality:\n"
+        "  --ppl-prompt FILE      Skip throughput sweep; tokenize FILE and compute\n"
+        "                         teacher-forced negative log-likelihood / perplexity.\n"
+        "                         Use to compare quality across --kv-cache dtypes.\n"
+        "  --ppl-max-tokens N     Score at most N tokens (default: 256).\n"
+        "\n"
         "  -h, --help             Show this help.\n");
 }
 
@@ -243,6 +256,10 @@ static bench_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-bench: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
                 exit(2);
             }
+        } else if (!strcmp(arg, "--ppl-prompt")) {
+            c.ppl_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ppl-max-tokens")) {
+            c.ppl_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -250,7 +267,12 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    if (c.ppl_prompt_path) {
+        /* PPL mode short-circuits the sweep options.  Use the ppl-prompt
+         * file as the prompt source and skip sweep input validation. */
+        if (c.ppl_max_tokens <= 0) c.ppl_max_tokens = 256;
+        c.prompt_path = c.ppl_prompt_path;
+    } else if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
     }
@@ -442,8 +464,86 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
             raw_ratio3, raw_ratio4, raw_ratio2);
 }
 
+/* Teacher-forced perplexity on a token sequence.  For each position i in
+ * [0, n-1) feed tokens[i], then read log P(tokens[i+1] | tokens[0..i])
+ * from the current logits.  Accumulate -logprob; report mean NLL and
+ * exp(mean_NLL).  Compares quality across --kv-cache dtypes apples-to-
+ * apples (deterministic, no sampling). */
+static int run_ppl_mode(const bench_config *cfg) {
+    ds4_engine_options opt = {
+        .model_path = cfg->model_path,
+        .backend = cfg->backend,
+        .n_threads = cfg->threads,
+        .warm_weights = cfg->warm_weights,
+        .quality = cfg->quality,
+        .kv_dtype = cfg->kv_dtype,
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) return 1;
+
+    char *text = read_file(cfg->prompt_path);
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, text, &prompt);
+    free(text);
+
+    int score_limit = cfg->ppl_max_tokens;
+    if (score_limit <= 0 || score_limit > prompt.len) score_limit = prompt.len;
+    if (score_limit < 2) {
+        fprintf(stderr, "ds4-bench: --ppl-prompt needs at least 2 tokens\n");
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    int ctx_size = score_limit + 16;
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, ctx_size) != 0) {
+        fprintf(stderr, "ds4-bench: failed to create session\n");
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    char err[256];
+    double nll_sum = 0.0;
+    int    scored  = 0;
+    double t0 = bench_now_sec();
+    for (int i = 0; i + 1 < score_limit; i++) {
+        if (ds4_session_eval(session, prompt.v[i], err, sizeof err) != 0) {
+            fprintf(stderr, "ds4-bench: ppl eval failed at pos %d: %s\n", i, err);
+            break;
+        }
+        ds4_token_score sc;
+        if (!ds4_session_token_logprob(session, prompt.v[i + 1], &sc)) {
+            fprintf(stderr, "ds4-bench: token_logprob failed at pos %d\n", i);
+            break;
+        }
+        if (!isfinite(sc.logprob)) continue;
+        nll_sum += -(double)sc.logprob;
+        scored++;
+    }
+    double elapsed = bench_now_sec() - t0;
+
+    const double avg_nll = scored > 0 ? (nll_sum / (double)scored) : 0.0;
+    const double ppl     = scored > 0 ? exp(avg_nll) : 0.0;
+    const char  *kv_name = ds4_kv_dtype_name(cfg->kv_dtype);
+    fprintf(stdout,
+            "ds4-bench: PPL teacher-forced  kv_cache=%s  tokens=%d  scored=%d  "
+            "elapsed=%.2fs\n"
+            "ds4-bench:   nll_avg=%.6f  ppl=%.6f\n",
+            kv_name, score_limit, scored, elapsed, avg_nll, ppl);
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
+    if (cfg.ppl_prompt_path) {
+        return run_ppl_mode(&cfg);
+    }
     log_context_memory(cfg.backend, cfg.ctx_alloc);
     log_kv_footprint_compare(cfg.backend, cfg.ctx_alloc, cfg.kv_dtype);
 
