@@ -12862,6 +12862,23 @@ static bool metal_graph_encode_layer_attention_batch(
                 for (uint32_t t = 0; t < n_tokens; t++) {
                     comp_counts[t] = (pos0 + t + 1u) / ratio;
                 }
+                /* Phase 7.2: dual-write packed companion when comp_dtype=turbo3.
+                 * Pack the float rows the compressor just wrote into the
+                 * packed pool.  Full-prefill path -> rows start at 0.
+                 * Reads from layer_attn_comp_cache_packed will be wired up
+                 * by Phase 7.3; the float pool stays load-bearing until 7.4. */
+                if (ok && g_ds4_comp_dtype == DS4_KV_TURBO3 &&
+                    g->layer_attn_comp_cache_packed[il] != NULL && n_comp != 0) {
+                    const uint64_t comp_row_bytes =
+                            ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+                    ok = ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+                            attn_comp_target,
+                            g->layer_attn_comp_cache_packed[il],
+                            n_comp,
+                            /* dst_first_row */ 0,
+                            DS4_N_HEAD_DIM,
+                            comp_row_bytes) != 0;
+                }
                 if (n_comp != 0) {
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   attn_comp_target,
