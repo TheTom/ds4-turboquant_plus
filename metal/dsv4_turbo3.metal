@@ -1755,10 +1755,10 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
                 m_chunk = max(m_chunk, scores_chunk[j]);
             }
             const float M_new = max(M, m_chunk);
-            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
+            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
             float l_chunk = 0.0f;
             for (uint j = 0; j < tile_rows; j++) {
-                scores_chunk[j] = exp(scores_chunk[j] - M_new);
+                scores_chunk[j] = precise::exp(scores_chunk[j] - M_new);
                 l_chunk += scores_chunk[j];
             }
             L = L * ms + l_chunk;
@@ -1791,8 +1791,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
         const float s_full = simd_sum(s_partial) * scale_qk + add;
 
         const float M_new = max(M, s_full);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(s_full - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(s_full - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) {
             acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
@@ -1804,8 +1804,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
     if (head_valid) {
         const float sink_s = sinks[my_head_abs];
         const float M_new = max(M, sink_s);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(sink_s - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(sink_s - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) acc[i] *= ms;
         M = M_new;
@@ -1964,10 +1964,10 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
             float m_chunk = -INFINITY;
             for (uint j = 0; j < tile_rows; j++) m_chunk = max(m_chunk, scores_chunk[j]);
             const float M_new = max(M, m_chunk);
-            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
+            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
             float l_chunk = 0.0f;
             for (uint j = 0; j < tile_rows; j++) {
-                scores_chunk[j] = exp(scores_chunk[j] - M_new);
+                scores_chunk[j] = precise::exp(scores_chunk[j] - M_new);
                 l_chunk += scores_chunk[j];
             }
             L = L * ms + l_chunk;
@@ -1997,8 +1997,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
         const float s_full = simd_sum(s_partial) * scale_qk + add;
 
         const float M_new = max(M, s_full);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(s_full - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(s_full - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) {
             acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
@@ -2009,8 +2009,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
     if (head_valid) {
         const float sink_s = sinks[my_head_abs];
         const float M_new = max(M, sink_s);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(sink_s - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(sink_s - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) acc[i] *= ms;
         M = M_new;
@@ -2168,10 +2168,10 @@ kernel void kernel_dsv4_attention_decode_h8_turbo2_f32(
             float m_chunk = -INFINITY;
             for (uint j = 0; j < tile_rows; j++) m_chunk = max(m_chunk, scores_chunk[j]);
             const float M_new = max(M, m_chunk);
-            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
+            const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
             float l_chunk = 0.0f;
             for (uint j = 0; j < tile_rows; j++) {
-                scores_chunk[j] = exp(scores_chunk[j] - M_new);
+                scores_chunk[j] = precise::exp(scores_chunk[j] - M_new);
                 l_chunk += scores_chunk[j];
             }
             L = L * ms + l_chunk;
@@ -2201,8 +2201,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo2_f32(
         const float s_full = simd_sum(s_partial) * scale_qk + add;
 
         const float M_new = max(M, s_full);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(s_full - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(s_full - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) {
             acc[i] = acc[i] * ms + vs * (float)kvrow[my_d0 + i];
@@ -2213,8 +2213,8 @@ kernel void kernel_dsv4_attention_decode_h8_turbo2_f32(
     if (head_valid) {
         const float sink_s = sinks[my_head_abs];
         const float M_new = max(M, sink_s);
-        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : exp(M - M_new);
-        const float vs = exp(sink_s - M_new);
+        const float ms = (isinf(M) && M < 0.0f) ? 0.0f : precise::exp(M - M_new);
+        const float vs = precise::exp(sink_s - M_new);
         L = L * ms + vs;
         for (uint i = 0; i < DIMS_PER_THREAD; i++) acc[i] *= ms;
         M = M_new;
