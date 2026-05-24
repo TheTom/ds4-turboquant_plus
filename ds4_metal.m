@@ -7670,10 +7670,13 @@ int ds4_gpu_attention_decode_h8_turbo3_tensor(
         uint32_t              head_dim,
         uint32_t              n_rot) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Phase 6.4: h8 default-ON for turbo3 — PPL drift is within fp8-noise
+     * (<0.5% at 1024 tokens) and short-context decode wins +20% vs Wave
+     * M3.  Set DS4_METAL_TURBO3_H8=0 to disable and fall back to Wave M3. */
     static int h8_enable = -1;
     if (h8_enable < 0) {
         const char *e = getenv("DS4_METAL_TURBO3_H8");
-        h8_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
+        h8_enable = (e && e[0] && e[0] == '0') ? 0 : 1;
     }
     if (!h8_enable) return 0;
     /* h8 kernel hard-codes head_dim=512, n_rot=64, n_head%8==0, single-
@@ -7801,10 +7804,13 @@ int ds4_gpu_attention_decode_h8_turbo4_tensor(
         uint32_t              head_dim,
         uint32_t              n_rot) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Phase 6.4: h8 default-ON for turbo4 (same rationale as turbo3 —
+     * PPL drift within fp8-noise, +20% short decode).  Disable via
+     * DS4_METAL_TURBO4_H8=0. */
     static int h8_enable = -1;
     if (h8_enable < 0) {
         const char *e = getenv("DS4_METAL_TURBO4_H8");
-        h8_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
+        h8_enable = (e && e[0] && e[0] == '0') ? 0 : 1;
     }
     if (!h8_enable) return 0;
     if (!heads || !model_map || !q || !raw_kv_bytes ||
