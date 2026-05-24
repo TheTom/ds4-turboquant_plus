@@ -18577,17 +18577,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
     ds4_kv_set_active_dtype(e->kv_dtype);
-    /* turbo3 KV is CUDA + CPU reference only.  Metal kernel is deferred — the
-     * Metal stubs print a one-line error if reached, but we fail fast here so
-     * the user sees a clean message at engine open rather than mid-decode. */
-    if (e->kv_dtype == DS4_KV_TURBO3 && e->backend == DS4_BACKEND_METAL) {
-        fprintf(stderr,
-            "ds4: --kv-cache turbo3 is not available on the Metal backend yet; "
-            "use --kv-cache fp8 (default) or run with --cuda or --cpu\n");
-        free(e);
-        *out = NULL;
-        return 1;
-    }
+    /* turbo3 KV on Metal: Phase 2b Wave M0-M2 ships pack/dequant +
+     * float-sim quantize round trip.  The Phase 2b inline-dequant
+     * attention kernels are CUDA-only; on Metal the launchers return 0
+     * and ds4.c's existing fallback paths use view_dispatch (dequant
+     * to scratch) + the stock Metal fp8 attention kernels.  Correct
+     * with full 4.75x memory savings on Metal; inline-dequant perf
+     * parity is future Wave M3+ work. */
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
