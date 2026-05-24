@@ -80,9 +80,11 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
-/* Phase 2b Wave M0/M1: turbo3 pack + dequant pipelines. */
+/* Phase 2b Wave M0/M1/M2: turbo3 pack + dequant pipelines. */
 static id<MTLComputePipelineState> g_dsv4_turbo3_kv_pack_pipeline;
+static id<MTLComputePipelineState> g_dsv4_turbo3_kv_pack_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo3_kv_dequant_to_scratch_pipeline;
+static id<MTLComputePipelineState> g_dsv4_turbo3_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
@@ -3233,6 +3235,22 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_dsv4_turbo3_kv_pack_batch_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_pack_batch_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_dsv4_turbo3_kv_pack_batch_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_dsv4_turbo3_kv_pack_batch_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_pack_batch_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_turbo3_kv_dequant_to_scratch_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_dequant_to_scratch_f32 function not found\n");
@@ -3243,6 +3261,22 @@ int ds4_gpu_init(void) {
         g_dsv4_turbo3_kv_dequant_to_scratch_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_dsv4_turbo3_kv_dequant_to_scratch_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_dequant_to_scratch_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_turbo3_kv_quantize_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_quantize_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_dsv4_turbo3_kv_quantize_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_dsv4_turbo3_kv_quantize_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_quantize_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -4506,7 +4540,9 @@ void ds4_gpu_cleanup(void) {
         g_rope_tail_batch_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_turbo3_kv_pack_pipeline = nil;
+        g_dsv4_turbo3_kv_pack_batch_pipeline = nil;
         g_dsv4_turbo3_kv_dequant_to_scratch_pipeline = nil;
+        g_dsv4_turbo3_kv_quantize_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
@@ -6512,9 +6548,30 @@ int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
         uint32_t          n_tok,
         uint32_t          head_dim,
         uint32_t          n_rot) {
-    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
-    fprintf(stderr, "ds4: --kv-cache turbo3 is CUDA-only in this build; Metal port deferred\n");
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
+    if (n_rot == head_dim) return 1;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        if (!xbuf || ds4_gpu_tensor_bytes(x) < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo3_kv_quantize_pipeline];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:0];
+        [enc setBytes:&n_tok    length:sizeof(uint32_t) atIndex:1];
+        [enc setBytes:&head_dim length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&n_rot    length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&signs_on length:sizeof(int)      atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo3 KV quantize")) return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_kv_turbo3_store_raw_tensor(
@@ -6610,10 +6667,9 @@ int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
     return 1;
 }
 
-/* Phase 2b Wave M1: ring-aware batched pack — TODO M2.  CUDA's
- * turbo3_kv_pack_batch_kernel needs a Metal sibling that handles the
- * (pos0 + t) % raw_cap ring wrap.  For now this is still a stub; turbo3
- * is rejected at engine open + Metal so it's never reached at runtime. */
+/* Phase 2b Wave M2: ring-aware batched pack.  Sibling of CUDA's
+ * turbo3_kv_pack_batch_kernel — writes each token's packed bytes to
+ * raw cache ring slot (pos0 + t) % raw_cap. */
 int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *raw,
@@ -6623,9 +6679,38 @@ int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
         uint32_t              head_dim,
         uint32_t              n_rot,
         uint64_t              row_bytes) {
-    (void)src; (void)raw; (void)raw_cap; (void)pos0; (void)n_tokens; (void)head_dim; (void)n_rot; (void)row_bytes;
-    fprintf(stderr, "ds4: turbo3 ring-aware batch pack not yet ported to Metal (M2 follow-up)\n");
-    return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!src || !raw || raw_cap == 0 || n_rot > head_dim) return 0;
+    if (n_tokens == 0) return 1;
+
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)src);
+        id<MTLBuffer> rbuf = ds4_gpu_tensor_buffer(raw);
+        if (!sbuf || !rbuf) return 0;
+        if (ds4_gpu_tensor_bytes(src) < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+        if (ds4_gpu_tensor_bytes(raw) < (uint64_t)raw_cap * row_bytes) return 0;
+
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo3_kv_pack_batch_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:rbuf offset:ds4_gpu_tensor_offset(raw) atIndex:1];
+        [enc setBytes:&raw_cap   length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&pos0      length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n_tokens  length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&head_dim  length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&n_rot     length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&row_bytes length:sizeof(uint64_t) atIndex:7];
+        [enc setBytes:&signs_on  length:sizeof(int)      atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo3 KV pack batch")) return 0;
+    }
+    return 1;
 }
 
 /* Phase 2b turbo3 attention launchers — Metal stubs.  The engine open

@@ -219,23 +219,38 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
             for (int i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
         }
 
-        // Matched-norm L2: find per-group max abs, scale so max < codebook
-        // ceiling, encode 3-bit indices, store FP8 E4M3 scale.
-        float amax = 0.0f;
-        for (int i = 0; i < 64; i++) amax = fmax(amax, fabs(buf[i]));
-        const float clamped = fmin(amax / DS4_TURBO3_MAX_D, DS4_FP8_E4M3_MAX_D);
-        const float scale   = clamped > 0.0f ? clamped : 1.0f;
-
-        // Quantize each value to nearest codebook centroid (via bounds table).
-        uchar idx[64];
+        // Matched-norm L2 scale (byte-equivalent to CUDA's
+        // turbo3_pack_group64_device): scale = sqrt(norm_sq) / sqrt(recon_sq)
+        // where recon = nearest centroid of (v * k_inv).  Falls back to
+        // amax / codebook_max when reconstruction is near-zero.  Clamped
+        // to E4M3 representable range.
+        float amax    = 0.0f;
+        float norm_sq = 0.0f;
         for (int i = 0; i < 64; i++) {
-            const float v = buf[i] / scale;
+            const float v  = buf[i];
+            const float av = fabs(v);
+            if (av > amax) amax = av;
+            norm_sq += v * v;
+        }
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX_D / amax) : 1.0f;
+
+        uchar idx[64];
+        float recon_sq = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            const float v = buf[i] * k_inv;
             int code = 0;
             for (int j = 0; j < 7; j++) {
-                if (v > DS4_TURBO3_BOUNDS[j]) code = j + 1;
+                if (v >= DS4_TURBO3_BOUNDS[j]) code = j + 1;
             }
             idx[i] = (uchar)code;
+            const float c = DS4_TURBO3_CODEBOOK[code];
+            recon_sq += c * c;
         }
+        const float recon_norm = sqrt(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrt(norm_sq) / recon_norm)
+                                            : (amax / DS4_TURBO3_MAX_D);
+        if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+        if (scale < 0.0f) scale = 0.0f;
 
         // Pack 8 values per 3 bytes (matches CUDA layout: bit-stream of
         // 3-bit codes, little-endian).
@@ -265,6 +280,213 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
         for (uint i = 0; i < (uint)n_rot * sizeof(float); i++) {
             rope_slot[i] = src_tail[i];
         }
+    }
+}
+
+// Phase 2b Wave M2: ring-aware batched pack — sibling of CUDA's
+// turbo3_kv_pack_batch_kernel.  Each token writes into ring slot
+// (pos0 + t) % raw_cap.  Grid: (n_tokens, 1, 1) × tg(64, 1, 1).
+kernel void kernel_dsv4_turbo3_kv_pack_batch_f32(
+        device const float *src              [[ buffer(0) ]],
+        device       uchar *raw              [[ buffer(1) ]],
+        constant     uint  &raw_cap          [[ buffer(2) ]],
+        constant     uint  &pos0             [[ buffer(3) ]],
+        constant     uint  &n_tokens         [[ buffer(4) ]],
+        constant     uint  &head_dim         [[ buffer(5) ]],
+        constant     uint  &n_rot            [[ buffer(6) ]],
+        constant     ulong &row_bytes        [[ buffer(7) ]],
+        constant     int   &signs_on         [[ buffer(8) ]],
+        uint                t                [[ threadgroup_position_in_grid ]],
+        uint                tid              [[ thread_position_in_threadgroup ]]) {
+    if (t >= n_tokens) return;
+    const uint  n_nope    = head_dim - n_rot;
+    const uint  n_groups  = n_nope / DS4_TURBO3_GROUP_SIZE;
+    const uint  ring_row  = (pos0 + t) % raw_cap;
+    device const float *src_row = src + t * head_dim;
+    device       uchar *dst_row = raw + ring_row * row_bytes;
+    const ulong data_bytes = (ulong)n_nope * 3u / 8u;
+    const float inv_sqrt_n = rsqrt(64.0f);
+
+    if (tid < n_groups) {
+        float buf[64];
+        device const float *gs = src_row + tid * DS4_TURBO3_GROUP_SIZE;
+        if (signs_on) {
+            for (int i = 0; i < 64; i++) buf[i] = gs[i] * DS4_TURBO_SIGNS1_64[i];
+        } else {
+            for (int i = 0; i < 64; i++) buf[i] = gs[i];
+        }
+        turbo3_wht64_inplace(buf);
+        for (int i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (int i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+
+        // Matched-norm L2 scale (same as the non-batched pack above).
+        float amax    = 0.0f;
+        float norm_sq = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            const float v  = buf[i];
+            const float av = fabs(v);
+            if (av > amax) amax = av;
+            norm_sq += v * v;
+        }
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX_D / amax) : 1.0f;
+        uchar idx[64];
+        float recon_sq = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            const float v = buf[i] * k_inv;
+            int code = 0;
+            for (int j = 0; j < 7; j++) {
+                if (v >= DS4_TURBO3_BOUNDS[j]) code = j + 1;
+            }
+            idx[i] = (uchar)code;
+            const float c = DS4_TURBO3_CODEBOOK[code];
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrt(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrt(norm_sq) / recon_norm)
+                                            : (amax / DS4_TURBO3_MAX_D);
+        if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+        if (scale < 0.0f) scale = 0.0f;
+
+        device uchar *data_slot = dst_row + tid * DS4_TURBO3_DATA_BYTES_PER_GROUP;
+        for (int chunk = 0; chunk < 8; chunk++) {
+            const uint v0 = idx[chunk * 8 + 0];
+            const uint v1 = idx[chunk * 8 + 1];
+            const uint v2 = idx[chunk * 8 + 2];
+            const uint v3 = idx[chunk * 8 + 3];
+            const uint v4 = idx[chunk * 8 + 4];
+            const uint v5 = idx[chunk * 8 + 5];
+            const uint v6 = idx[chunk * 8 + 6];
+            const uint v7 = idx[chunk * 8 + 7];
+            data_slot[chunk * 3 + 0] = (uchar)((v0) | (v1 << 3) | (v2 << 6));
+            data_slot[chunk * 3 + 1] = (uchar)((v2 >> 2) | (v3 << 1) | (v4 << 4) | (v5 << 7));
+            data_slot[chunk * 3 + 2] = (uchar)((v5 >> 1) | (v6 << 2) | (v7 << 5));
+        }
+        dst_row[data_bytes + tid] = turbo3_fp8_e4m3_encode(scale);
+    }
+
+    if (tid == 0 && n_rot > 0) {
+        const ulong scale_bytes = (ulong)n_groups;
+        device uchar *rope_slot = dst_row + data_bytes + scale_bytes;
+        device const uchar *src_tail = (device const uchar *)(src_row + n_nope);
+        for (uint i = 0; i < (uint)n_rot * sizeof(float); i++) {
+            rope_slot[i] = src_tail[i];
+        }
+    }
+}
+
+// Phase 1 float-sim quantize kernel — sibling of CUDA's
+// turbo3_kv_quantize_kernel.  Applies turbo3 quantization noise to a
+// float [n_tok, head_dim] tensor in place (used for comp_kv round
+// trips where attention kernels read comp_kv as floats but the values
+// must look like what turbo3 storage would dequant to).  No packing,
+// no storage change — input + output are both float.
+//
+// 64 threads per row, one element per thread.  Uses 64-float
+// threadgroup scratch for the WHT butterfly + a second 64-float
+// scratch for per-thread amax/norm reductions.
+kernel void kernel_dsv4_turbo3_kv_quantize_f32(
+        device       float *x                [[ buffer(0) ]],
+        constant     uint  &n_tok            [[ buffer(1) ]],
+        constant     uint  &head_dim         [[ buffer(2) ]],
+        constant     uint  &n_rot            [[ buffer(3) ]],
+        constant     int   &signs_on         [[ buffer(4) ]],
+        uint                row              [[ threadgroup_position_in_grid ]],
+        uint                tid              [[ thread_position_in_threadgroup ]]) {
+    if (row >= n_tok) return;
+    const uint n_nope = head_dim - n_rot;
+    device float *xr = x + row * head_dim;
+    threadgroup float buf[64];
+    threadgroup float redux[64];
+    const float inv_sqrt_n = rsqrt(64.0f);
+
+    for (uint off = 0; off < n_nope; off += 64) {
+        float v = (off + tid < n_nope) ? xr[off + tid] : 0.0f;
+        if (signs_on) v *= DS4_TURBO_SIGNS1_64[tid];
+        buf[tid] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Forward WHT in threadgroup memory.  Match CUDA wht64_block exactly:
+        // low thread (lower index of pair) writes (self + other);
+        // high thread writes (other - self) — NOT (self - other).
+        for (int stride = 1; stride < 64; stride <<= 1) {
+            const uint pair = tid ^ stride;
+            const float self_v = buf[tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float other_v = buf[pair];
+            const float out = (tid < pair) ? (self_v + other_v) : (other_v - self_v);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            buf[tid] = out;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float rotated = buf[tid] * inv_sqrt_n;
+        if (signs_on) rotated *= DS4_TURBO_SIGNS2_64[tid];
+
+        // Block max of |rotated| via threadgroup memory reduce.
+        redux[tid] = fabs(rotated);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) redux[tid] = fmax(redux[tid], redux[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float amax = redux[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Block sum of rotated*rotated.
+        redux[tid] = rotated * rotated;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) redux[tid] = redux[tid] + redux[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float norm_sq = redux[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX_D / amax) : 1.0f;
+
+        // Quantize this thread's element to nearest centroid.
+        const float rv = rotated * k_inv;
+        int code = 0;
+        for (int j = 0; j < 7; j++) {
+            if (rv >= DS4_TURBO3_BOUNDS[j]) code = j + 1;
+        }
+        const float centroid = DS4_TURBO3_CODEBOOK[code];
+
+        // Block sum of centroid*centroid → recon L2.
+        redux[tid] = centroid * centroid;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) redux[tid] = redux[tid] + redux[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float recon_norm = sqrt(redux[0]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float scale = (recon_norm > 1e-10f) ? (sqrt(norm_sq) / recon_norm)
+                                            : (amax / DS4_TURBO3_MAX_D);
+        if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+
+        float dequant = centroid * scale;
+        if (signs_on) dequant *= DS4_TURBO_SIGNS2_64[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf[tid] = dequant;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inverse WHT (same self-inverse butterfly).
+        for (int stride = 1; stride < 64; stride <<= 1) {
+            const uint pair = tid ^ stride;
+            const float a = buf[tid];
+            const float b = buf[pair];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            buf[tid] = (tid < pair) ? (a + b) : (a - b);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float final_v = buf[tid] * inv_sqrt_n;
+        if (signs_on) final_v *= DS4_TURBO_SIGNS1_64[tid];
+
+        if (off + tid < n_nope) xr[off + tid] = final_v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
