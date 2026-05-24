@@ -38,6 +38,8 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
+    /* KV cache compression simulation; fp8 is the historical default. */
+    ds4_kv_dtype kv_dtype;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -69,6 +71,7 @@ static void usage(FILE *fp) {
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
+        "  --kv-cache fp8|turbo3  KV cache compression simulation. Default: fp8 (historical path).\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -234,6 +237,12 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--kv-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.kv_dtype)) {
+                fprintf(stderr, "ds4-bench: unknown --kv-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
+                exit(2);
+            }
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -335,12 +344,14 @@ static int write_frontier_logits_json(
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            "  \"kv_cache\":\"%s\",\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             ds4_backend_name(cfg->backend),
             cfg->quality ? "true" : "false",
+            ds4_kv_dtype_name(cfg->kv_dtype),
             ds4_engine_routed_quant_bits(engine),
             frontier,
             frontier,
@@ -403,6 +414,7 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .kv_dtype = cfg.kv_dtype,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

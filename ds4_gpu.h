@@ -254,6 +254,21 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* TurboQuant+ 3-bit Lloyd-Max in-place quality round trip.  Sibling of the FP8
+ * variant above with the same in/out contract: takes a [n_tok, head_dim] float
+ * tensor, leaves the last n_rot elements per row untouched (RoPE tail), and
+ * mutates the first head_dim - n_rot elements per row by quantizing them to
+ * 3-bit Lloyd-Max codebook indices inside a 64-element Randomized Hadamard
+ * rotation, then dequantizing back to the original basis.  Storage layout is
+ * unchanged from the FP8 path so the surrounding cache write logic stays
+ * identical — only the quantization error differs.  See ds4_kv_dtype in ds4.h
+ * for the algorithm rationale and prior-art citation chain. */
+int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -279,6 +294,17 @@ int ds4_gpu_rope_tail_tensor(
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
 int ds4_gpu_kv_fp8_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          row,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+/* Fused turbo3 quant + raw-cache store: sibling of ds4_gpu_kv_fp8_store_raw_tensor
+ * that applies the TurboQuant+ 3-bit round trip before writing the raw KV row.
+ * Storage layout unchanged. */
+int ds4_gpu_kv_turbo3_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,

@@ -20,6 +20,32 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* KV cache compression dtype selection.
+ *
+ * DS4_KV_FP8 (default): the historical path.  The non-RoPE part of each compressed
+ * KV row goes through an in-place E4M3 round trip in groups of 64 — values stay as
+ * float32 in memory but pick up the FP8 quantization error so the CPU reference
+ * matches what the Metal graph would store as packed FP8.  No layout change.
+ *
+ * DS4_KV_TURBO3: TurboQuant+ port from TheTom/llama-cpp-turboquant (CUDA-only here).
+ * Same 64-element group structure as FP8, but per-group: apply a Randomized
+ * Hadamard Transform (two-sided Rademacher signs around a 64-point Walsh-Hadamard
+ * butterfly), then quantize each rotated coordinate to a 3-bit Lloyd-Max codebook
+ * for N(0,1), then dequantize back and apply the inverse rotation.  The result is
+ * a float row in the original basis with the 3-bit quality penalty baked in —
+ * downstream attention math is unchanged.  Storage layout is identical to FP8.
+ *
+ * Reform note: this is a quality-simulation in-place round trip exactly like FP8.
+ * The point is to make ds4 understand the new dtype end-to-end so a future Metal
+ * port can flip the storage to actual packed 3-bit bytes (saves ~5x bandwidth on
+ * the latent cache) once the engine math is proven correct on CUDA. */
+typedef enum {
+    DS4_KV_FP8 = 0,
+    DS4_KV_TURBO3 = 1,
+} ds4_kv_dtype;
+const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
+int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
@@ -72,6 +98,10 @@ typedef struct {
     int power_percent;
     bool warm_weights;
     bool quality;
+    /* KV cache dtype.  Default DS4_KV_FP8 keeps the historical path; DS4_KV_TURBO3
+     * swaps in the TurboQuant+ 3-bit-per-element quality simulation on CUDA and
+     * CPU reference.  See ds4_kv_dtype above for the algorithm summary. */
+    ds4_kv_dtype kv_dtype;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
