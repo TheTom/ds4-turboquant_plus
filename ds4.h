@@ -27,24 +27,70 @@ typedef enum {
  * float32 in memory but pick up the FP8 quantization error so the CPU reference
  * matches what the Metal graph would store as packed FP8.  No layout change.
  *
- * DS4_KV_TURBO3: TurboQuant+ port from TheTom/llama-cpp-turboquant (CUDA-only here).
- * Same 64-element group structure as FP8, but per-group: apply a Randomized
- * Hadamard Transform (two-sided Rademacher signs around a 64-point Walsh-Hadamard
- * butterfly), then quantize each rotated coordinate to a 3-bit Lloyd-Max codebook
- * for N(0,1), then dequantize back and apply the inverse rotation.  The result is
- * a float row in the original basis with the 3-bit quality penalty baked in —
- * downstream attention math is unchanged.  Storage layout is identical to FP8.
+ * DS4_KV_TURBO3: TurboQuant+ port from TheTom/llama-cpp-turboquant.  Storage layout
+ * is packed 3-bit Lloyd-Max indices + per-group FP8 scale bytes (Phase 2) — the
+ * cache buffer is byte-addressed at `row * ds4_kv_row_bytes(head_dim, n_rot, ...)`,
+ * NOT float-addressed at `row * head_dim`.  Every attention kernel inline-dequants
+ * the packed bytes on V-load.  The Randomized Hadamard rotation + N(0,1) Lloyd-Max
+ * codebook + matched-norm L2 scale are computed once on cache store; reads pay only
+ * the dequant (one byte load + LUT lookup + FP8-to-f32 multiply per element).
  *
- * Reform note: this is a quality-simulation in-place round trip exactly like FP8.
- * The point is to make ds4 understand the new dtype end-to-end so a future Metal
- * port can flip the storage to actual packed 3-bit bytes (saves ~5x bandwidth on
- * the latent cache) once the engine math is proven correct on CUDA. */
+ * Memory savings per row: ds4 head_dim=512, n_rot=64, group=64.
+ *   fp8 (float-sim): 512 * 4 = 2048 bytes
+ *   turbo3 (packed): (448*3/8) + (448/64) + (64*4) = 168 + 7 + 256 = 431 bytes
+ *   -> 4.75x smaller per row.  The 9x figure in upstream TQ+ docs is the
+ *      latent-only ratio (175/1792); RoPE-tail floats are unavoidable on MLA. */
 typedef enum {
     DS4_KV_FP8 = 0,
     DS4_KV_TURBO3 = 1,
 } ds4_kv_dtype;
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
+
+/* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 — the same WHT
+ * group cadence used by the Phase 1 float-sim quantizer; one matched-norm L2
+ * scale per 64 elements.  See the Phase 1 comment block in ds4.c
+ * (`dsv4_turbo3_kv_quantize_row_inplace_cpu`) for the per-group algorithm.
+ *
+ *   data section   : (head_dim - n_rot) * 3 / 8 bytes
+ *                    packed 3-bit indices, 8 values per 3 bytes
+ *                    (b0 = v0|(v1<<3)|(v2<<6), b1 = (v2>>2)|(v3<<1)|..., b2 = ...)
+ *   scale section  : (head_dim - n_rot) / DS4_TURBO3_GROUP_SIZE FP8 E4M3 bytes
+ *                    one per 64-element group, matched-norm L2 scale
+ *   rope tail      : n_rot * sizeof(float)
+ *                    untouched RoPE coordinates (these carry positional freqs)
+ *
+ * Stored values are in the ORIGINAL basis (we apply the inverse rotation on
+ * write so the dequanted values match what the Phase 1 float-sim path
+ * produced).  Readers dequant one 64-element group at a time into a small
+ * stack scratch via `dequant_group`: load 24 packed bytes + 1 FP8 scale →
+ * 64 floats in the rotated basis (centroid * scale) → 64-point iWHT-with-
+ * signs → 64 original-basis floats.  This trades ~3.5x dequant compute per
+ * group for ~25x less memory traffic vs the fp8 float-sim cache.  The
+ * advantage is that every existing reader (attention dot loops, compressor
+ * pool, disk save, MTP draft) sees the same original-basis values it did
+ * before — only the storage byte layout changes. */
+#define DS4_TURBO3_GROUP_SIZE 64u
+uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype);
+
+/* Footprint estimator broken down by section, parameterized on dtype.  Used by
+ * `ds4-bench --print-kv-footprint` to print side-by-side fp8 vs turbo3 sizes.
+ *
+ *   raw_bytes        : the SWA ring window across all layers.
+ *   compressed_bytes : per-layer compressor output + indexer (always float).
+ *   total_bytes      : sum of the above.
+ *
+ * For Phase 2 turbo3, `raw_bytes` reflects the packed-byte layout.  The
+ * compressed pools (attn_comp + index_comp) and the compressor state arrays
+ * remain float because the compressor pool integrates softmax-weighted
+ * accumulations that require an original-basis read; see the deferred-scope
+ * note in docs/turbo3-roadmap.md. */
+typedef struct {
+    uint64_t raw_bytes;
+    uint64_t compressed_bytes;
+    uint64_t total_bytes;
+} ds4_kv_footprint;
+ds4_kv_footprint ds4_kv_footprint_estimate(ds4_backend backend, int ctx_size, ds4_kv_dtype dtype);
 
 typedef enum {
     DS4_THINK_NONE,
