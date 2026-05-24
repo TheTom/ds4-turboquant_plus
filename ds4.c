@@ -2276,7 +2276,14 @@ static DS4_MAYBE_UNUSED void dsv4_turbo3_kv_unpack_row_cpu(
  * or fence is required. */
 static ds4_kv_dtype g_ds4_kv_dtype = DS4_KV_FP8;
 
+/* Phase 3a: compressed-cache dtype.  Distinct from g_ds4_kv_dtype so ds4-asym
+ * (raw=turbo3 + comp=fp8, or raw=fp8 + comp=turbo3, etc.) is expressible.
+ * Default DS4_KV_FP8 preserves the historical float-sim path; DS4_KV_TURBO3
+ * packs comp rows to 200 B (10.24x vs float, 5.12x vs f16 staging). */
+static ds4_kv_dtype g_ds4_comp_dtype = DS4_KV_FP8;
+
 static void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype; }
+static void ds4_comp_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_comp_dtype = dtype; }
 
 /* Returns 1 when the active dtype uses the packed-byte row layout (turbo3 or
  * turbo4), 0 for the historical fp8 float-stride path.  Use this for layout
@@ -2446,6 +2453,21 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
         const uint64_t scale_bytes = (uint64_t)n_groups;
         const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
         return data_bytes + scale_bytes + rope_bytes;
+    }
+    return (uint64_t)head_dim * sizeof(float);
+}
+
+/* Phase 3a: row byte size for the per-layer compressed cache.  No RoPE tail
+ * (compressor output is the full head_dim).  At head_dim=512:
+ *   fp8  (float-sim): 512 * 4 = 2048 bytes/row
+ *   turbo3 (packed) : 512 * 3 / 8 + 512 / 64 = 192 + 8 = 200 bytes/row
+ *                     -> 10.24x smaller per row */
+uint64_t ds4_comp_row_bytes(uint32_t head_dim, ds4_kv_dtype dtype) {
+    if (dtype == DS4_KV_TURBO3) {
+        const uint32_t n_groups = (head_dim + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
+        const uint64_t data_bytes = ((uint64_t)head_dim * 3u + 7u) / 8u;
+        const uint64_t scale_bytes = (uint64_t)n_groups;
+        return data_bytes + scale_bytes;
     }
     return (uint64_t)head_dim * sizeof(float);
 }
@@ -15906,6 +15928,8 @@ struct ds4_engine {
      * Set once at engine open from ds4_engine_options.kv_dtype; immutable
      * thereafter so cache values within a session stay consistent. */
     ds4_kv_dtype kv_dtype;
+    /* Phase 3a: comp cache dtype, independent of kv_dtype. */
+    ds4_kv_dtype comp_dtype;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -18897,12 +18921,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
-    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers
-     * are linker-only stubs.  Reject early with a clear message so the
-     * user picks a supported (backend, dtype) combo instead of silently
+    e->comp_dtype = opt->comp_dtype;
+    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers are
+     * linker-only stubs.  Reject early with a clear message so the user
+     * picks a supported (backend, dtype) combo instead of silently
      * falling through to fp8 mid-run.  Phase 4 follow-up will port the
-     * turbo4/turbo2 kernels back to CUDA (atlas branch has the
-     * reference implementations). */
+     * turbo4/turbo2 kernels back to CUDA. */
     if (e->backend == DS4_BACKEND_CUDA &&
         (e->kv_dtype == DS4_KV_TURBO4 || e->kv_dtype == DS4_KV_TURBO2)) {
         fprintf(stderr,
@@ -18913,7 +18937,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    /* --comp-cache turbo3 is CUDA + CPU only as of Phase 3a foundation —
+     * Metal wire-up of the compressed comp pool is Phase 7+ work. */
+    if (e->backend == DS4_BACKEND_METAL && e->comp_dtype == DS4_KV_TURBO3) {
+        fprintf(stderr,
+                "ds4: --comp-cache turbo3 is not available on Metal yet; "
+                "use --backend cuda or omit --comp-cache\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     ds4_kv_set_active_dtype(e->kv_dtype);
+    ds4_comp_set_active_dtype(e->comp_dtype);
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;

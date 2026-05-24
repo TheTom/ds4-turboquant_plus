@@ -117,7 +117,11 @@ static void usage(FILE *fp) {
         "                  last 13%% of bytes)\n"
         "        turbo2 -- 2-bit codebook, 5.46x raw shrink, MSE 0.117 (opt-in ultra\n"
         "                  compression; quality regression is real)\n"
-        "      All four work on CUDA + Metal.\n"
+        "      All four work on CUDA + Metal (turbo4/turbo2 Metal-only this build).\n"
+        "  --comp-cache fp8|turbo3\n"
+        "      Compressed comp-cache dtype (Phase 3a scaffolding, CUDA-only).\n"
+        "      Packs the per-layer attn_comp_cache to turbo3 bytes (10.24x vs float).\n"
+        "      Foundation only — alloc/store/read plumbing is Phase 7+ follow-up.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1469,6 +1473,12 @@ static cli_config parse_options(int argc, char **argv) {
             const char *kv_name = need_arg(&i, argc, argv, arg);
             if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
                 fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8, turbo3, turbo4 or turbo2)\n", kv_name);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *cc_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(cc_name, &c.engine.comp_dtype)) {
+                fprintf(stderr, "ds4: unknown --comp-cache value '%s' (expected fp8 or turbo3)\n", cc_name);
                 exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
