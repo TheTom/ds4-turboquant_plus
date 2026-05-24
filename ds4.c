@@ -2146,10 +2146,7 @@ static void ds4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_
 static int ds4_gpu_kv_quantize_tensor_dispatch(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
-        /* DEBUG: force fp8 quant noise even in turbo3 mode to isolate
-         * whether pack/dequant alone is correct.  Revert if fp8 quant
-         * here produces sensible output. */
-        return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
+        return ds4_gpu_dsv4_turbo3_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
     }
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
 }
