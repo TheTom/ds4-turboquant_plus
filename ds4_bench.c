@@ -41,6 +41,10 @@ typedef struct {
     bool quality;
     /* KV cache compression simulation; fp8 is the historical default. */
     ds4_kv_dtype kv_dtype;
+    /* Compressed comp_cache dtype (Phase 7).  fp8 (default) keeps the
+     * existing float / f16 comp pool.  turbo3 compresses comp rows too,
+     * for long-context memory savings. */
+    ds4_kv_dtype comp_dtype;
     /* PPL teacher-forced quality measurement.  When set, skips the
      * throughput sweep and instead tokenizes the file, walks token by
      * token, accumulates -log P(token_t | tokens_<t), and prints
@@ -269,6 +273,12 @@ static bench_config parse_options(int argc, char **argv) {
             const char *kv_name = need_arg(&i, argc, argv, arg);
             if (!ds4_kv_dtype_from_name(kv_name, &c.kv_dtype)) {
                 fprintf(stderr, "ds4-bench: unknown --kv-cache value '%s' (expected fp8, turbo3 or turbo4)\n", kv_name);
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--comp-cache")) {
+            const char *kv_name = need_arg(&i, argc, argv, arg);
+            if (!ds4_kv_dtype_from_name(kv_name, &c.comp_dtype)) {
+                fprintf(stderr, "ds4-bench: unknown --comp-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
                 exit(2);
             }
         } else if (!strcmp(arg, "--ppl-prompt")) {
@@ -535,6 +545,7 @@ static int run_ppl_mode(const bench_config *cfg) {
         .warm_weights = cfg->warm_weights,
         .quality = cfg->quality,
         .kv_dtype = cfg->kv_dtype,
+        .comp_dtype = cfg->comp_dtype,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
@@ -767,6 +778,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .kv_dtype = cfg.kv_dtype,
+        .comp_dtype = cfg.comp_dtype,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
