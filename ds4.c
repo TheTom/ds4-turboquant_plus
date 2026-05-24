@@ -10896,25 +10896,51 @@ static bool metal_graph_encode_decode_layer(
                             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
                 }
             } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
-                rc = ds4_gpu_attention_decode_heads_turbo4_tensor(
+                rc = ds4_gpu_attention_decode_h8_turbo4_tensor(
                         g->heads, model->map, model->size,
                         layer->attn_sinks->abs_offset,
-                        g->q, raw_cache, row_bytes, n_raw,
-                        raw_cap, raw_start,
+                        g->q, raw_cache, row_bytes,
                         n_comp ? comp_cache : NULL,
                         metal_graph_attn_comp_cache_is_f16(),
-                        n_comp, NULL, 0,
+                        NULL, 0,
+                        /* n_tokens */ 1u, /* pos0 */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window */ 0u, /* ratio */ 0u,
                         DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo4_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
             } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
-                rc = ds4_gpu_attention_decode_heads_turbo2_tensor(
+                rc = ds4_gpu_attention_decode_h8_turbo2_tensor(
                         g->heads, model->map, model->size,
                         layer->attn_sinks->abs_offset,
-                        g->q, raw_cache, row_bytes, n_raw,
-                        raw_cap, raw_start,
+                        g->q, raw_cache, row_bytes,
                         n_comp ? comp_cache : NULL,
                         metal_graph_attn_comp_cache_is_f16(),
-                        n_comp, NULL, 0,
+                        NULL, 0,
+                        /* n_tokens */ 1u, /* pos0 */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window */ 0u, /* ratio */ 0u,
                         DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo2_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
             }
             if (rc == 0) {
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
