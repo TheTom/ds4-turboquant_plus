@@ -269,10 +269,10 @@ int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* Phase 2 packed-byte pack kernel.  Reads a [n_tok, head_dim] float tensor
- * (the post-RoPE KV projection output) and writes the turbo3 packed bytes
- * into `dst` at `n_tok * dst_row_bytes` total bytes.  `dst_row_bytes` must
- * equal `ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3)`. */
+/* Packed-byte pack kernel.  Reads a [n_tok, head_dim] float tensor (the
+ * post-RoPE KV projection output) and writes the turbo3 packed bytes into
+ * `dst` at `n_tok * dst_row_bytes` total bytes.  `dst_row_bytes` must equal
+ * `ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3)`. */
 int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *dst,
@@ -281,13 +281,12 @@ int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
         uint32_t              n_rot,
         uint64_t              dst_row_bytes);
 
-/* Phase 2 decompress-to-scratch entry point.  Reads `n_rows` packed turbo3
- * rows from `src` (each `src_row_bytes` long) and writes original-basis
- * floats into `dst` at the natural `[n_rows, head_dim]` float layout that
- * the existing attention kernels expect.  Called before each attention
- * dispatch when the active dtype is DS4_KV_TURBO3 so the attention kernels
- * can read floats unchanged.  Phase 2b would inline this dequant into each
- * attention kernel directly to capture the V-load bandwidth win. */
+/* Decompress-to-scratch entry point.  Reads `n_rows` packed turbo3 rows from
+ * `src` (each `src_row_bytes` long) and writes original-basis floats into
+ * `dst` at the natural `[n_rows, head_dim]` float layout that the existing
+ * attention kernels expect.  Used by attention paths that have no inline-
+ * dequant sibling; the inline-dequant kernels below skip this hop and read
+ * packed bytes directly to capture the V-load bandwidth win. */
 int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *dst,
@@ -296,7 +295,7 @@ int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
         uint32_t              n_rot,
         uint64_t              src_row_bytes);
 
-/* Phase 2 ring-aware batch pack into the SWA cache.  Mirrors
+/* Ring-aware batch pack into the SWA cache.  Mirrors
  * ds4_gpu_store_raw_kv_batch_tensor (the fp8 path) - same `(pos0 + t) % raw_cap`
  * ring-write semantics but writes packed turbo3 bytes per row. */
 int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
@@ -574,10 +573,11 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* Phase 2b turbo3 attention launchers - packed-byte raw cache.  Live
+/* Inline-dequant turbo3 attention launchers.  Read the packed-byte raw cache
+ * directly and dequant inside each K/V load to skip the scratch hop.  Live
  * implementations in ds4_cuda.cu; Metal builds get stub returns in
- * ds4_metal.m (never reached since engine open rejects --kv-cache
- * turbo3 + --metal). */
+ * ds4_metal.m (never reached since engine open rejects --kv-cache turbo3 +
+ * --metal). */
 int ds4_gpu_attention_decode_heads_turbo3_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,

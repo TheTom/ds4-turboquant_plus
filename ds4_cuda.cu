@@ -2507,22 +2507,23 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================================================
 // TurboQuant+ turbo3 KV quality simulation - CUDA kernel.
+// =========================================================================
 //
 // Sibling of fp8_kv_quantize_kernel above; same in-place [n_tok, head_dim]
 // contract; same group-of-64 cadence on the first head_dim - n_rot elements;
 // RoPE tail untouched.  Per group:
-//   1. forward Randomized Hadamard: signs1 (Rademacher) → 64-point WHT
-//      → 1/sqrt(64) → signs2 (Rademacher).
+//   1. forward Randomized Hadamard: signs1 (Rademacher) -> 64-point WHT
+//      -> 1/sqrt(64) -> signs2 (Rademacher).
 //   2. block-wide amax + sum-of-squares reduction (warp shfl in two halves).
-//   3. amax → scale into 3-bit Lloyd-Max codebook range for N(0,1).
+//   3. amax -> scale into 3-bit Lloyd-Max codebook range for N(0,1).
 //   4. per-element quantize to nearest centroid; block-wide reduction on the
 //      centroid recon L2 norm to compute the matched-norm scale
 //      (||original|| / ||centroid_recon||) - same MSE-vs-amax trick used in
 //      reshape_and_cache_flash_turbo3 in atlas/kernels/gb10/common/.
 //   5. dequantize centroid * matched-norm scale.
-//   6. inverse rotation: signs2 → WHT → 1/sqrt(64) → signs1.
+//   6. inverse rotation: signs2 -> WHT -> 1/sqrt(64) -> signs1.
 //
 // Grid: <<<n_tok, 64>>>.  One block per token, one thread per element of the
 // 64-element group; the per-token outer loop walks each group sequentially so
@@ -2668,7 +2669,7 @@ __global__ static void turbo3_kv_quantize_kernel(float *x, uint32_t n_tok, uint3
         // 4. dequant in rotated basis
         float dequant = centroid * scale;
 
-        // 5. inverse rotation: signs2 → WHT → 1/sqrt(64) → signs1
+        // 5. inverse rotation: signs2 -> WHT -> 1/sqrt(64) -> signs1
         if (signs_on) dequant *= DS4_TURBO_SIGNS2_64_D[tid];
         __syncthreads();
         buf[tid] = dequant;
@@ -2682,8 +2683,9 @@ __global__ static void turbo3_kv_quantize_kernel(float *x, uint32_t n_tok, uint3
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase 2: packed turbo3 cache storage + inline dequant for attention V-load.
+// =========================================================================
+// Packed turbo3 cache storage + inline dequant for attention V-load.
+// =========================================================================
 //
 // Layout per cache row (head_dim=512, n_rot=64, GROUP_SIZE=64):
 //   bytes  0..167  : packed 3-bit indices  (n_nope * 3/8 = 168 bytes)
@@ -2701,10 +2703,11 @@ __global__ static void turbo3_kv_quantize_kernel(float *x, uint32_t n_tok, uint3
 // the same per-element distribution it would have read in the fp8 float-sim
 // path, modulo the FP8 group scale's ~12% precision.
 //
-// Reference: ds4_phase2_atlas_patterns.md (Section 2 dequant primitive, Section
-// 3 BC=4 batched pattern).  Atlas's turbo3 uses GROUP_SIZE=16 for finer scale
-// granularity; ds4 stays on the Phase-1 GROUP_SIZE=64 cadence so the matched-
-// norm scale arithmetic and `--logprob-vectors` regression remain valid.
+// We stay on GROUP_SIZE=64 (the cadence the float-sim quantizer above uses)
+// so the matched-norm scale arithmetic and `--logprob-vectors` regression
+// remain valid.  Upstream TurboQuant+ uses GROUP_SIZE=16 for finer scale
+// granularity but that would invalidate the existing pack-vs-float-sim
+// equivalence the test suite assumes.
 
 // Forward declaration: defined in the host-emitted constant tables below.
 #define TURBO3_GROUP_SIZE 64
@@ -2799,8 +2802,7 @@ __device__ __forceinline__ void turbo3_iwht64_inplace_device(float *buf) {
 // loads = 64 mem ops + 0 compute.  So we trade ~4x memory traffic for ~200
 // compute ops per group - favorable when the K row is hot in cache, which
 // it isn't on long SWA scans where the trade reverses to ~25x less BW for
-// ~3.5x more compute (see ds4_phase2_atlas_patterns.md §3 for the BC=4
-// amortization analysis).
+// ~3.5x more compute.
 __device__ __forceinline__ void turbo3_dequant_group64_device(
         float               *out64,
         const unsigned char *row_base,
@@ -2817,9 +2819,8 @@ __device__ __forceinline__ void turbo3_dequant_group64_device(
 
     // Pre-scaled centroid cache.  Hoists `centroid[c] * scale` out of the
     // per-element loop so we do 8 multiplies once per group instead of 64
-    // multiplies per group.  Pattern from
-    // /tmp/ds4_phase2_llamacpp_patterns.md §2.3 (TheTom/llama-cpp-turboquant
-    // fattn-vec.cuh:478-512 "Per-block scaled-centroid cache").
+    // multiplies per group.  Pattern from TheTom/llama-cpp-turboquant
+    // fattn-vec.cuh "Per-block scaled-centroid cache".
     float sc[8];
     #pragma unroll
     for (int c = 0; c < 8; c++) sc[c] = DS4_TURBO3_CODEBOOK_D[c] * scale;
@@ -2914,10 +2915,9 @@ extern "C" __global__ void turbo3_kv_pack_batch_kernel(
 // expect.  Grid: <<<n_rows, 64>>>.  Thread `tid` in {0..6} handles its group;
 // thread 0 also copies the RoPE tail.
 //
-// Used by the Phase 2 raw-cache decompress-to-scratch pass before each
-// attention dispatch - the existing 12 attention kernels read the scratch
-// unchanged.  See docs/turbo3-roadmap.md for the Phase 2b inline-dequant
-// follow-up that eliminates this intermediate.
+// Used by the raw-cache decompress-to-scratch pass when an attention path
+// has no inline-dequant sibling.  The inline-dequant kernels below skip this
+// hop entirely and read packed rows directly.
 extern "C" __global__ void turbo3_kv_dequant_to_scratch_kernel(
         const unsigned char * __restrict__ src,
         float               * __restrict__ dst,
@@ -3074,10 +3074,9 @@ __device__ __forceinline__ float turbo3_load_unaligned_f32(const unsigned char *
     return f;
 }
 
-// Phase 2b Wave 1.1: inline-dequant turbo3 sibling of
-// attention_prefill_raw_kernel.  Reads packed turbo3 bytes from
-// raw_kv_bytes directly instead of going through the
-// turbo3_kv_dequant_to_scratch_kernel intermediate.
+// Inline-dequant turbo3 sibling of attention_prefill_raw_kernel.  Reads
+// packed turbo3 bytes from raw_kv_bytes directly instead of going through
+// the turbo3_kv_dequant_to_scratch_kernel intermediate.
 //
 // Footprint per launch: zero scratch dequant memory; saves ~431 B/row
 // vs the float sim path (head_dim=512: 2048 B float -> 431 B packed).
@@ -3502,21 +3501,18 @@ __global__ static void attention_unpack_group_low_kernel(
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
 }
 
-// Phase 2b Wave 1.2: inline-dequant turbo3 sibling of
-// attention_decode_mixed_kernel for the simple per-row path
-// (n_tokens == 1 || visible_comp == 0).  Reads packed turbo3 bytes
-// from raw_kv_bytes directly; the comp_kv path stays float because
-// the compressed cache is not turbo3-quantized.
+// Inline-dequant turbo3 sibling of attention_decode_mixed_kernel for the
+// simple per-row path (n_tokens == 1 || visible_comp == 0).  Reads packed
+// turbo3 bytes from raw_kv_bytes directly; the comp_kv path stays float
+// because the compressed cache is not turbo3-quantized.
 //
-// This is the actual hot-path inline dequant - decode-token
-// generation always lands here for n_tokens=1 + turbo3 + view_dispatch
-// callers.  Eliminates one full-cap dequant-to-scratch hop per layer
-// per token, which is the source of the Phase 2a -13% gen_tps
-// regression.
+// Decode-token generation always lands here for n_tokens=1 + turbo3 +
+// view_dispatch callers, eliminating a full-cap dequant-to-scratch hop per
+// layer per token.
 //
-// The 8-lane warp-shuffle path is NOT implemented here - host
-// dispatcher falls back to attention_decode_mixed_kernel + the
-// existing dequant-to-scratch when use_comp_mask + n_tokens>1.
+// The 8-lane warp-shuffle path is NOT implemented here - host dispatcher
+// falls back to attention_decode_mixed_kernel + the existing
+// dequant-to-scratch when use_comp_mask + n_tokens>1.
 //
 // Metal portability: same pure-scalar template as
 // attention_prefill_raw_turbo3_kernel - see that kernel's preamble.
@@ -3678,7 +3674,7 @@ __global__ static void attention_decode_mixed_turbo3_kernel(
             if (tile_rows > ROWS_PER_TILE) tile_rows = ROWS_PER_TILE;
             // Cooperative dequant: each thread handles up to 1 group dequant
             // (groups 0..tile_rows*n_groups-1) AND multiple RoPE bytes.
-            uint32_t total_groups = tile_rows * n_groups;   // ≤ 16*7 = 112
+            uint32_t total_groups = tile_rows * n_groups;   // <= 16*7 = 112
             if (threadIdx.x < total_groups) {
                 uint32_t tr = threadIdx.x / n_groups;
                 uint32_t g  = threadIdx.x % n_groups;
@@ -3690,7 +3686,7 @@ __global__ static void attention_decode_mixed_turbo3_kernel(
                 for (uint32_t i = 0; i < 64; i++) gd[i] = buf[i];
             }
             // RoPE: tile_rows*n_rot floats = up to 16*64 = 1024 floats.
-            // 256 threads × 4 each fills exactly when ROWS_PER_TILE=16.
+            // 256 threads * 4 each fills exactly when ROWS_PER_TILE=16.
             uint32_t total_rope = tile_rows * n_rot;
             for (uint32_t idx = threadIdx.x; idx < total_rope; idx += blockDim.x) {
                 uint32_t tr = idx / n_rot;
@@ -3931,15 +3927,14 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
-// Phase 2b Wave 1.3: inline-dequant turbo3 sibling of
-// attention_indexed_mixed_kernel.  Targets the n_tokens=1
-// decode-token hot path with comp_count > 0 (post-indexer selection).
+// Inline-dequant turbo3 sibling of attention_indexed_mixed_kernel.  Targets
+// the n_tokens=1 decode-token hot path with comp_count > 0 (post-indexer
+// selection).
 //
-// K-dot 8-lane partition is a clean fit for turbo3: 8 threads ×
-// 64 elements per row = exactly 7 groups (turbo3 dequant) + 1 RoPE
-// tail (64 floats).  Each thread owns one slice = one group OR the
-// RoPE tail, all kept in registers, then shfl-reduce.  No shared
-// dequant scratch needed for K-dot.
+// K-dot 8-lane partition is a clean fit for turbo3: 8 threads * 64 elements
+// per row = exactly 7 groups (turbo3 dequant) + 1 RoPE tail (64 floats).
+// Each thread owns one slice = one group OR the RoPE tail, all kept in
+// registers, then shfl-reduce.  No shared dequant scratch needed for K-dot.
 //
 // V-acc reuses the cooperative-shmem pattern from
 // attention_decode_mixed_turbo3_kernel.
@@ -4538,7 +4533,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
-// Phase 2b Wave 2.3: inline-dequant turbo3 sibling of
+// Inline-dequant turbo3 sibling of
 // attention_indexed_mixed_heads8_online_kernel.  Same template + tile
 // structure as the fp8 version (ROWS_PER_STAGE rows per tile,
 // HEADS_PER_GROUP warps per CTA).  Cooperative populate of kv_shared
@@ -5035,15 +5030,14 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
 }
 
-// Phase 2b Wave 2.1: inline-dequant turbo3 sibling of
-// attention_decode_mixed_heads8_online_kernel.  FlashAttention-style
-// online softmax: tile of TILE_M=4 rows cooperatively loaded into
-// kv_shared, then each of 8 warps owns one head's per-row K-dot +
-// V-acc update.
+// Inline-dequant turbo3 sibling of
+// attention_decode_mixed_heads8_online_kernel.  FlashAttention-style online
+// softmax: tile of TILE_M=4 rows cooperatively loaded into kv_shared, then
+// each of 8 warps owns one head's per-row K-dot + V-acc update.
 //
-// Cooperative load phase rewritten to inline-dequant turbo3 packed
-// rows directly into kv_shared.  Comp rows stay on the float4 load
-// path (compressed cache is not turbo3-quantized).
+// Cooperative load phase rewritten to inline-dequant turbo3 packed rows
+// directly into kv_shared.  Comp rows stay on the float4 load path
+// (compressed cache is not turbo3-quantized).
 __global__ static void attention_decode_mixed_heads8_online_turbo3_kernel(
         float               *heads,
         const float         *sinks,
@@ -7965,7 +7959,7 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_
     return cuda_ok(cudaGetLastError(), "turbo3_kv_quantize launch");
 }
 
-/* Phase 2 packed-write entry point.  `src` is the float KV input tensor
+/* Packed-write entry point.  `src` is the float KV input tensor
  * ([n_tok, head_dim]); `dst` is the packed-byte cache region ([n_tok *
  * dst_row_bytes]).  Caller is responsible for having computed dst_row_bytes
  * via ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO3). */
@@ -7988,7 +7982,7 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
     return cuda_ok(cudaGetLastError(), "turbo3_kv_pack launch");
 }
 
-/* Phase 2 ring-aware batched pack entry point.  Mirrors
+/* Ring-aware batched pack entry point.  Mirrors
  * ds4_gpu_store_raw_kv_batch_tensor but writes packed turbo3 bytes per row.
  * `raw_cap` is the SWA ring capacity; `pos0` is the logical start; `n_tokens`
  * rows are packed into ring slots `(pos0 + t) % raw_cap`. */
@@ -8013,13 +8007,12 @@ extern "C" int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
     return cuda_ok(cudaGetLastError(), "turbo3_kv_pack_batch launch");
 }
 
-/* Phase 2 dequant-to-scratch entry point.  Reads `n_rows` packed turbo3 rows
- * from `src` (each `src_row_bytes` long) and writes original-basis floats
- * into `dst` at the `[n_rows, head_dim]` float layout the existing attention
- * kernels expect.  Used to decompress the layer_raw_cache into a per-graph
- * float scratch tensor before each attention dispatch - the existing 12
- * attention kernels read the scratch as if it were the old float cache.
- * Phase 2b would inline this dequant into each attention kernel directly. */
+/* Dequant-to-scratch entry point.  Reads `n_rows` packed turbo3 rows from
+ * `src` (each `src_row_bytes` long) and writes original-basis floats into
+ * `dst` at the `[n_rows, head_dim]` float layout the existing attention
+ * kernels expect.  Used by the attention paths that have no inline-dequant
+ * sibling; the inline-dequant kernels skip this hop and read packed rows
+ * directly to capture the V-load bandwidth win. */
 extern "C" int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *dst,
@@ -8534,12 +8527,11 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
-/* Phase 2b Wave 1.2 entry point: turbo3-packed sibling of
- * ds4_gpu_attention_decode_heads_tensor.  Reads the packed turbo3
- * raw cache directly via attention_decode_mixed_turbo3_kernel -
- * skips the dequant-to-scratch hop on the decode-token call site
- * (metal_graph_decode_layer).  Falls back via return-0 when
- * conditions aren't met (caller should retry the float path). */
+/* Turbo3-packed sibling of ds4_gpu_attention_decode_heads_tensor.  Reads
+ * the packed turbo3 raw cache directly via attention_decode_mixed_turbo3_kernel
+ * - skips the dequant-to-scratch hop on the decode-token call site
+ * (metal_graph_decode_layer).  Falls back via return-0 when conditions
+ * aren't met (caller should retry the float path). */
 extern "C" int ds4_gpu_attention_decode_heads_turbo3_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -8573,8 +8565,7 @@ extern "C" int ds4_gpu_attention_decode_heads_turbo3_tensor(
         return 0;
     }
     /* Score buffer fit + simple-path predicate.  Decode-token always
-     * runs simple (n_tokens=1).  Window/online fall-back left to the
-     * caller for now (will land in Wave 2).
+     * runs simple (n_tokens=1); window/online fall through to the caller.
      *
      * The turbo3 kernel uses a smaller scores[2048] buffer (vs
      * DS4_CUDA_ATTENTION_SCORE_CAP=8192) to leave shmem for the V-acc
@@ -8700,12 +8691,10 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
     return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
 }
 
-/* Phase 2b Wave 1.1 entry point: turbo3-packed sibling of
- * ds4_gpu_attention_prefill_raw_heads_tensor.  Reads packed-byte cache
- * directly via the inline-dequant kernel - skips the
- * turbo3_kv_dequant_to_scratch_kernel hop.  Window-attention and cublas
- * fast paths NOT yet wired here; Wave 2 will add those when the
- * _online kernels migrate. */
+/* Turbo3-packed sibling of ds4_gpu_attention_prefill_raw_heads_tensor.
+ * Reads packed-byte cache directly via the inline-dequant kernel - skips
+ * the turbo3_kv_dequant_to_scratch_kernel hop.  Window-attention and cublas
+ * fast paths fall back to the float-sim/dequant-to-scratch route. */
 extern "C" int ds4_gpu_attention_prefill_raw_turbo3_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -8884,20 +8873,17 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, window, ratio, n_head, head_dim);
 }
 
-/* Phase 2b Wave 1.2 entry point: turbo3-packed sibling of
+/* Turbo3-packed sibling of
  * ds4_gpu_attention_decode_{raw,mixed}_batch_heads_tensor.
  *
  * Reads the packed turbo3 raw cache directly via the inline-dequant
  * kernel (attention_decode_mixed_turbo3_kernel) - skips the
- * dequant-to-scratch hop for the simple (n_tokens=1) decode-token
- * case, which is the bandwidth source of the Phase 2a -13% gen_tps
- * regression.
+ * dequant-to-scratch hop for the simple (n_tokens=1) decode-token case.
  *
- * Eligibility check (caller side): turbo3 mode AND n_tokens=1.  In
- * fp8 mode or for n_tokens>1 prefill chunks, callers should keep
- * using the float-input launchers.  This entry point does NOT cover
- * the 8-lane warp path or the _online window-attention path -
- * Wave 2 follow-up adds those. */
+ * Eligibility check (caller side): turbo3 mode AND n_tokens=1.  In fp8
+ * mode or for n_tokens>1 prefill chunks, callers should keep using the
+ * float-input launchers.  The n_tokens>1 / window-attention path goes
+ * through the heads8_online turbo3 kernel branch below. */
 extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -8940,11 +8926,11 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
 
-    /* Wave 2.1: n_tokens > 1 (prefill chunk) or use_comp_mask routes
-     * through the heads8_online turbo3 kernel.  Falls back via return
-     * 0 if the window-mask shape isn't supported.  Note the online
-     * kernel doesn't take comp_mask - caller should fall through to
-     * the float path when use_comp_mask is set. */
+    /* n_tokens > 1 (prefill chunk) or use_comp_mask routes through the
+     * heads8_online turbo3 kernel.  Falls back via return 0 if the
+     * window-mask shape isn't supported.  Note the online kernel doesn't
+     * take comp_mask - caller should fall through to the float path when
+     * use_comp_mask is set. */
     if (use_comp_mask) return 0;
     if (n_tokens > 1u || !cuda_attention_score_buffer_fits(n_comp) ||
         getenv("DS4_CUDA_FORCE_TURBO3_ONLINE") != NULL) {
@@ -8963,7 +8949,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo3_heads_tensor(
         return cuda_ok(cudaGetLastError(), "attention_decode_mixed_heads8_online_turbo3 launch");
     }
 
-    /* Wave 1.2: n_tokens=1 simple-path decode-token. */
+    /* n_tokens=1 simple-path decode-token. */
     /* Turbo3 kernel scores[2048] cap; fall back on overflow. */
     if (n_comp + 256u > 2048u) return 0;
     dim3 grid(n_tokens, n_head, 1);
@@ -9093,14 +9079,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
-/* Phase 2b Wave 1.3 entry point: turbo3-packed sibling of
- * ds4_gpu_attention_indexed_mixed_batch_heads_tensor.  Reads packed
- * turbo3 raw cache directly via attention_indexed_mixed_turbo3_kernel.
- *
- * Restricted to the n_tokens=1 decode-token Wave 1 fallback (the
- * heads8_online and rb4 paths are not migrated yet - Wave 2/3 work).
- * Returns 0 on any unsupported shape so the caller can fall back to
- * the float path via view_dispatch. */
+/* Turbo3-packed sibling of ds4_gpu_attention_indexed_mixed_batch_heads_tensor.
+ * Reads packed turbo3 raw cache directly via
+ * attention_indexed_mixed_turbo3_kernel.  Returns 0 on any unsupported shape
+ * so the caller can fall back to the float path via view_dispatch.  The
+ * prefill chunk path (n_tokens > 1, top_k <= 512) goes through the
+ * heads8_online turbo3 kernel branch below. */
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -9145,8 +9129,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
 
-    /* Wave 2.3: prefill chunk path (n_tokens > 1 + top_k <= 512) goes
-     * through the heads8_online turbo3 kernel. */
+    /* Prefill chunk path (n_tokens > 1 + top_k <= 512) goes through the
+     * heads8_online turbo3 kernel. */
     if (n_tokens > 1u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL &&
         getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
@@ -9176,7 +9160,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo3_heads_tensor(
                 ds4_turbo_signs_enabled_dev());
         return cuda_ok(cudaGetLastError(), "attention_indexed_mixed_heads8_online_turbo3 launch");
     }
-    /* Wave 1.3: decode-token n_tokens=1 simple-path. */
+    /* Decode-token n_tokens=1 simple-path. */
     if (n_tokens != 1u) return 0;
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_turbo3_kernel<<<grid, 256>>>(

@@ -47,7 +47,7 @@ typedef struct {
      * nll_avg / ppl / scored_tokens. */
     const char *ppl_prompt_path;
     int          ppl_max_tokens;
-    /* Quality validation (Phase 9): KLD + top-K agreement vs a baseline run.
+    /* Quality validation: KLD + top-K agreement vs a baseline run.
      * --quality-emit FILE writes per-position full-vocab logits during a PPL
      * run; --quality-baseline FILE reads such a dump and compares each
      * position's logit vector to the current run's, reporting KL divergence
@@ -453,8 +453,10 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
     const double mib = 1.0 / (1024.0 * 1024.0);
     const double raw_ratio = (t3.raw_bytes > 0)
             ? ((double)fp8.raw_bytes / (double)t3.raw_bytes) : 0.0;
-    /* Print the SWA ring (the only pool that swaps to packed bytes in Phase
-     * 2a) plus the compressed pools (kept float / F16 - see roadmap). */
+    /* Print the SWA ring (the only pool that swaps to packed bytes) plus
+     * the compressed pools (kept float / F16 because the compressor pool
+     * integrates softmax-weighted accumulations that need an original-basis
+     * read). */
     fprintf(stderr,
             "ds4-bench: KV footprint @ ctx=%d:\n"
             "  fp8     raw=%.2f MiB  compressed=%.2f MiB  total=%.2f MiB%s\n"
@@ -473,8 +475,8 @@ static void log_kv_footprint_compare(ds4_backend backend, int ctx_size, ds4_kv_d
             (double)(fp8.raw_bytes - t3.raw_bytes) * mib);
 }
 
-/* Phase 9 quality-dump binary format.  Magic "DS4Q" | u32 vocab | u32 scored
- * | (scored × vocab × float32 logits).  Logits are written RAW, not
+/* Quality-dump binary format.  Magic "DS4Q" | u32 vocab | u32 scored
+ * | (scored * vocab * float32 logits).  Logits are written RAW, not
  * softmaxed; the comparator runs log-sum-exp on read. */
 #define DS4_QDUMP_MAGIC "DS4Q"
 
@@ -512,7 +514,7 @@ static void ds4_top_k_indices(const float *logits, int n, int k, int *out_idx) {
  * exp(mean_NLL).  Compares quality across --kv-cache dtypes apples-to-
  * apples (deterministic, no sampling).
  *
- * Optional Phase 9 modes:
+ * Optional modes:
  *   --quality-emit FILE      Dump per-position raw logits to FILE.
  *   --quality-baseline FILE  Read baseline FILE, compare every position's
  *                            logits to current run.  Reports:
@@ -625,7 +627,7 @@ static int run_ppl_mode(const bench_config *cfg) {
     char err[256];
     double nll_sum = 0.0;
     int    scored  = 0;
-    /* Phase 9 quality accumulators */
+    /* Quality-vs-baseline accumulators (only used when --quality-baseline). */
     double kld_sum = 0.0;
     double kld_max = 0.0;
     int    top1_match = 0;
@@ -731,7 +733,7 @@ static int run_ppl_mode(const bench_config *cfg) {
         const double top1_pct = 100.0 * (double)top1_match / (double)qcompared;
         const double top5_pct = 100.0 * (double)top5_match / (double)qcompared;
         fprintf(stdout,
-                "ds4-bench: Phase9 quality vs baseline (%s)  positions=%d\n"
+                "ds4-bench: quality vs baseline (%s)  positions=%d\n"
                 "ds4-bench:   KLD(baseline||current)  mean=%.6f nats  max=%.6f nats\n"
                 "ds4-bench:   top-1 agreement=%.2f%%   top-5 agreement=%.2f%%\n",
                 cfg->quality_baseline_path, qcompared,

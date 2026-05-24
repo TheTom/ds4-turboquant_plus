@@ -5,13 +5,9 @@
 // arrays DS4_TURBO3_CODEBOOK_D + DS4_TURBO_SIGNS{1,2}_64_D (Lloyd-Max 3-bit
 // codebook for N(0,1) + two-sided Rademacher signs for the 64-point WHT).
 //
-// Phase 2b Wave M0 (this file): primitive + pack/dequant kernels.  Attention
-// kernels with inline turbo3 dequant follow in Wave M2-M4 - they include
-// this file via #include "dsv4_turbo3.metal" or duplicate the inline
-// functions in their own .metal file.
-//
-// See `[[ds4 TQ+ Metal Port - Plan for Next Session]]` in the vault for the
-// CUDA -> MSL translation table + wave breakdown.
+// This file ships the primitive + pack/dequant kernels.  Inline-dequant
+// attention kernels live in the surrounding ds4_metal.m as stubs until the
+// Metal turbo3 cache path goes live.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -120,7 +116,7 @@ static inline uchar turbo3_fp8_e4m3_encode(float x) {
 // from a packed row, writes 64 original-basis floats into `out64`.
 //
 // Cost per call (per thread): 24 byte loads + 1 FP8 byte + 64 LUT lookups +
-// 64 muls + 6-stage 64-element butterfly + signs1 mul ≈ 200 fp ops.  Same
+// 64 muls + 6-stage 64-element butterfly + signs1 mul ~ 200 fp ops.  Same
 // envelope as CUDA.
 static inline void turbo3_dequant_group64(
         thread float        out64[64],
@@ -180,9 +176,9 @@ static inline float turbo3_load_unaligned_f32(device const uchar *p) {
     return as_type<float>(v);
 }
 
-// Phase 2 pack kernel - sibling of CUDA's turbo3_kv_pack_kernel.  Reads a
+// Pack kernel - sibling of CUDA's turbo3_kv_pack_kernel.  Reads a
 // [n_tok, head_dim] float tensor (post-RoPE KV projection output) and writes
-// [n_tok * dst_row_bytes] packed bytes.  Grid: (n_tok, 1, 1) × tg(64,1,1).
+// [n_tok * dst_row_bytes] packed bytes.  Grid: (n_tok, 1, 1) x tg(64,1,1).
 //
 // One thread per group of 64 elements.  Thread 0 also copies the RoPE tail.
 kernel void kernel_dsv4_turbo3_kv_pack_f32(
@@ -283,9 +279,9 @@ kernel void kernel_dsv4_turbo3_kv_pack_f32(
     }
 }
 
-// Phase 2b Wave M2: ring-aware batched pack - sibling of CUDA's
-// turbo3_kv_pack_batch_kernel.  Each token writes into ring slot
-// (pos0 + t) % raw_cap.  Grid: (n_tokens, 1, 1) × tg(64, 1, 1).
+// Ring-aware batched pack - sibling of CUDA's turbo3_kv_pack_batch_kernel.
+// Each token writes into ring slot (pos0 + t) % raw_cap.  Grid:
+// (n_tokens, 1, 1) x tg(64, 1, 1).
 kernel void kernel_dsv4_turbo3_kv_pack_batch_f32(
         device const float *src              [[ buffer(0) ]],
         device       uchar *raw              [[ buffer(1) ]],
@@ -376,7 +372,7 @@ kernel void kernel_dsv4_turbo3_kv_pack_batch_f32(
     }
 }
 
-// Phase 1 float-sim quantize kernel - sibling of CUDA's
+// Float-sim quantize kernel - sibling of CUDA's
 // turbo3_kv_quantize_kernel.  Applies turbo3 quantization noise to a
 // float [n_tok, head_dim] tensor in place (used for comp_kv round
 // trips where attention kernels read comp_kv as floats but the values
@@ -453,7 +449,7 @@ kernel void kernel_dsv4_turbo3_kv_quantize_f32(
         }
         const float centroid = DS4_TURBO3_CODEBOOK[code];
 
-        // Block sum of centroid*centroid → recon L2.
+        // Block sum of centroid*centroid -> recon L2.
         redux[tid] = centroid * centroid;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = 32; stride > 0; stride >>= 1) {
@@ -490,11 +486,11 @@ kernel void kernel_dsv4_turbo3_kv_quantize_f32(
     }
 }
 
-// Phase 2 dequant-to-scratch kernel - sibling of CUDA's
+// Dequant-to-scratch kernel - sibling of CUDA's
 // turbo3_kv_dequant_to_scratch_kernel.  Reads `n_rows` packed turbo3 rows
 // from `src` (each `src_row_bytes` long) and writes original-basis floats
 // into `dst` at the natural [n_rows, head_dim] float layout.  Grid:
-// (n_rows, 1, 1) × tg(64, 1, 1).  Thread `tid` in {0..n_groups-1} handles
+// (n_rows, 1, 1) x tg(64, 1, 1).  Thread `tid` in {0..n_groups-1} handles
 // its group; thread 0 also copies the RoPE tail.
 kernel void kernel_dsv4_turbo3_kv_dequant_to_scratch_f32(
         device const uchar *src              [[ buffer(0) ]],

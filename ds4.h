@@ -28,9 +28,9 @@ typedef enum {
  * matches what the Metal graph would store as packed FP8.  No layout change.
  *
  * DS4_KV_TURBO3: TurboQuant+ port from TheTom/llama-cpp-turboquant.  Storage layout
- * is packed 3-bit Lloyd-Max indices + per-group FP8 scale bytes (Phase 2) - the
- * cache buffer is byte-addressed at `row * ds4_kv_row_bytes(head_dim, n_rot, ...)`,
- * NOT float-addressed at `row * head_dim`.  Every attention kernel inline-dequants
+ * is packed 3-bit Lloyd-Max indices + per-group FP8 scale bytes - the cache buffer
+ * is byte-addressed at `row * ds4_kv_row_bytes(head_dim, n_rot, ...)`, NOT
+ * float-addressed at `row * head_dim`.  Every attention kernel inline-dequants
  * the packed bytes on V-load.  The Randomized Hadamard rotation + N(0,1) Lloyd-Max
  * codebook + matched-norm L2 scale are computed once on cache store; reads pay only
  * the dequant (one byte load + LUT lookup + FP8-to-f32 multiply per element).
@@ -48,9 +48,9 @@ const char *ds4_kv_dtype_name(ds4_kv_dtype dtype);
 int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
 
 /* Packed turbo3 byte layout per cache row.  GROUP_SIZE is 64 - the same WHT
- * group cadence used by the Phase 1 float-sim quantizer; one matched-norm L2
- * scale per 64 elements.  See the Phase 1 comment block in ds4.c
- * (`dsv4_turbo3_kv_quantize_row_inplace_cpu`) for the per-group algorithm.
+ * group cadence the float-sim quantizer uses, one matched-norm L2 scale per
+ * 64 elements.  See `dsv4_turbo3_kv_quantize_row_inplace_cpu` in ds4.c for
+ * the per-group algorithm.
  *
  *   data section   : (head_dim - n_rot) * 3 / 8 bytes
  *                    packed 3-bit indices, 8 values per 3 bytes
@@ -61,15 +61,15 @@ int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out);
  *                    untouched RoPE coordinates (these carry positional freqs)
  *
  * Stored values are in the ORIGINAL basis (we apply the inverse rotation on
- * write so the dequanted values match what the Phase 1 float-sim path
- * produced).  Readers dequant one 64-element group at a time into a small
- * stack scratch via `dequant_group`: load 24 packed bytes + 1 FP8 scale →
- * 64 floats in the rotated basis (centroid * scale) → 64-point iWHT-with-
- * signs → 64 original-basis floats.  This trades ~3.5x dequant compute per
- * group for ~25x less memory traffic vs the fp8 float-sim cache.  The
- * advantage is that every existing reader (attention dot loops, compressor
- * pool, disk save, MTP draft) sees the same original-basis values it did
- * before - only the storage byte layout changes. */
+ * write so the dequanted values match what the float-sim path produced).
+ * Readers dequant one 64-element group at a time into a small stack scratch
+ * via `dequant_group`: load 24 packed bytes + 1 FP8 scale -> 64 floats in the
+ * rotated basis (centroid * scale) -> 64-point iWHT-with-signs -> 64
+ * original-basis floats.  This trades ~3.5x dequant compute per group for
+ * ~25x less memory traffic vs the fp8 float-sim cache.  The advantage is
+ * that every existing reader (attention dot loops, compressor pool, disk
+ * save, MTP draft) sees the same original-basis values it did before - only
+ * the storage byte layout changes. */
 #define DS4_TURBO3_GROUP_SIZE 64u
 uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype);
 
@@ -80,11 +80,10 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
  *   compressed_bytes : per-layer compressor output + indexer (always float).
  *   total_bytes      : sum of the above.
  *
- * For Phase 2 turbo3, `raw_bytes` reflects the packed-byte layout.  The
- * compressed pools (attn_comp + index_comp) and the compressor state arrays
- * remain float because the compressor pool integrates softmax-weighted
- * accumulations that require an original-basis read; see the deferred-scope
- * note in docs/turbo3-roadmap.md. */
+ * For turbo3, `raw_bytes` reflects the packed-byte layout.  The compressed
+ * pools (attn_comp + index_comp) and the compressor state arrays remain
+ * float because the compressor pool integrates softmax-weighted accumulations
+ * that require an original-basis read. */
 typedef struct {
     uint64_t raw_bytes;
     uint64_t compressed_bytes;

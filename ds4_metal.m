@@ -80,7 +80,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
-/* Phase 2b Wave M0/M1/M2: turbo3 pack + dequant pipelines. */
+/* turbo3 packed-byte pack + dequant pipelines. */
 static id<MTLComputePipelineState> g_dsv4_turbo3_kv_pack_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo3_kv_pack_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo3_kv_dequant_to_scratch_pipeline;
@@ -3218,7 +3218,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        /* Phase 2b Wave M0/M1: turbo3 pack + dequant pipelines. */
+        /* turbo3 packed-byte pack + dequant pipelines. */
         fn = [library newFunctionWithName:@"kernel_dsv4_turbo3_kv_pack_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_turbo3_kv_pack_f32 function not found\n");
@@ -6611,9 +6611,9 @@ int ds4_gpu_kv_turbo3_store_raw_tensor(
     return 0;
 }
 
-/* Phase 2b Wave M1: turbo3 sym pack - single-row + multi-row, no ring.
- * Mirrors CUDA's turbo3_kv_pack_kernel.  Dispatched as one threadgroup
- * per row, 64 threads per group (one per 64-elem group + RoPE-tail thread). */
+/* turbo3 pack, single-row or multi-row (no ring).  Mirrors CUDA's
+ * turbo3_kv_pack_kernel.  Dispatched as one threadgroup per row, 64 threads
+ * per group (one per 64-elem group + RoPE-tail thread). */
 int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *dst,
@@ -6652,8 +6652,8 @@ int ds4_gpu_dsv4_turbo3_kv_pack_tensor(
     return 1;
 }
 
-/* Phase 2b Wave M1: turbo3 sym dequant-to-scratch.
- * Mirrors CUDA's turbo3_kv_dequant_to_scratch_kernel. */
+/* turbo3 dequant-to-scratch.  Mirrors CUDA's
+ * turbo3_kv_dequant_to_scratch_kernel. */
 int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *dst,
@@ -6692,9 +6692,9 @@ int ds4_gpu_dsv4_turbo3_kv_dequant_to_scratch_tensor(
     return 1;
 }
 
-/* Phase 2b Wave M2: ring-aware batched pack.  Sibling of CUDA's
- * turbo3_kv_pack_batch_kernel - writes each token's packed bytes to
- * raw cache ring slot (pos0 + t) % raw_cap. */
+/* Ring-aware batched pack.  Sibling of CUDA's turbo3_kv_pack_batch_kernel -
+ * writes each token's packed bytes to raw cache ring slot
+ * (pos0 + t) % raw_cap. */
 int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
         const ds4_gpu_tensor *src,
         ds4_gpu_tensor       *raw,
@@ -6738,10 +6738,10 @@ int ds4_gpu_dsv4_turbo3_kv_pack_batch_tensor(
     return 1;
 }
 
-/* Phase 2b turbo3 attention launchers - Metal stubs.  The engine open
- * guard in ds4.c rejects --kv-cache turbo3 + --metal so these never run,
- * but the linker needs the symbols since the call sites in ds4.c are
- * compiled-in regardless of backend. */
+/* Inline-dequant turbo3 attention launchers - Metal stubs.  The engine open
+ * guard in ds4.c rejects --kv-cache turbo3 + --metal so these never run, but
+ * the linker needs the symbols since the call sites in ds4.c are compiled-in
+ * regardless of backend. */
 int ds4_gpu_attention_decode_heads_turbo3_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
