@@ -12744,3 +12744,163 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
+
+/* =========================================================================
+ * turbo4 + turbo2 (Phase 3) — CUDA stubs.
+ *
+ * The 4-bit and 2-bit Lloyd-Max KV dtypes shipped in Phase 3 are
+ * currently Metal-only; the dispatch sites in ds4.c reference these
+ * symbols regardless of backend, so we need C++ stubs to link.  All
+ * stubs return 0 ("kernel rejected") -- the engine-open guard in
+ * ds4.c rejects `--backend cuda + --kv-cache turbo4|turbo2` before
+ * any of these get called at runtime.
+ *
+ * Phase 4 follow-up: port the Metal kernels (metal/dsv4_turbo3.metal,
+ * turbo4_dequant_group64 / turbo2_dequant_group64 + attention) back
+ * to CUDA using the atlas reference (atlas/kernels/gb10/common/
+ * paged_decode_attn_turbo{2,4}*.cu, reshape_and_cache_turbo.cu).
+ * ========================================================================= */
+
+extern "C" int ds4_gpu_dsv4_turbo4_kv_quantize_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo4_kv_pack_tensor(
+        const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+        uint32_t n_tok, uint32_t head_dim, uint32_t n_rot, uint64_t dst_row_bytes) {
+    (void)src; (void)dst; (void)n_tok; (void)head_dim; (void)n_rot; (void)dst_row_bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo4_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot, uint64_t src_row_bytes) {
+    (void)src; (void)dst; (void)n_rows; (void)head_dim; (void)n_rot; (void)src_row_bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src, ds4_gpu_tensor *raw,
+        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+        uint32_t head_dim, uint32_t n_rot, uint64_t row_bytes) {
+    (void)src; (void)raw; (void)raw_cap; (void)pos0; (void)n_tokens;
+    (void)head_dim; (void)n_rot; (void)row_bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_heads_turbo4_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16, uint32_t n_comp,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_mask,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)n_raw; (void)raw_cap; (void)raw_start;
+    (void)comp_kv; (void)comp_kv_f16; (void)n_comp; (void)comp_mask; (void)use_mask;
+    (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo4_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16;
+    (void)comp_mask; (void)use_comp_mask; (void)n_tokens; (void)pos0;
+    (void)n_raw; (void)raw_cap; (void)raw_start; (void)n_comp; (void)window;
+    (void)ratio; (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_indexed_mixed_batch_turbo4_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *topk, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t top_k, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16; (void)topk;
+    (void)n_tokens; (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start;
+    (void)n_comp; (void)top_k; (void)window; (void)ratio;
+    (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_prefill_raw_turbo4_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        uint32_t n_tokens, uint32_t window,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)n_tokens; (void)window;
+    (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo2_kv_quantize_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo2_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+        uint32_t n_rows, uint32_t head_dim, uint32_t n_rot, uint64_t src_row_bytes) {
+    (void)src; (void)dst; (void)n_rows; (void)head_dim; (void)n_rot; (void)src_row_bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src, ds4_gpu_tensor *raw,
+        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+        uint32_t head_dim, uint32_t n_rot, uint64_t row_bytes) {
+    (void)src; (void)raw; (void)raw_cap; (void)pos0; (void)n_tokens;
+    (void)head_dim; (void)n_rot; (void)row_bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_heads_turbo2_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16, uint32_t n_comp,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_mask,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)n_raw; (void)raw_cap; (void)raw_start;
+    (void)comp_kv; (void)comp_kv_f16; (void)n_comp; (void)comp_mask; (void)use_mask;
+    (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_mixed_batch_turbo2_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes, uint64_t row_bytes,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t n_rot) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)raw_kv_bytes; (void)row_bytes; (void)comp_kv; (void)comp_kv_f16;
+    (void)comp_mask; (void)use_comp_mask; (void)n_tokens; (void)pos0;
+    (void)n_raw; (void)raw_cap; (void)raw_start; (void)n_comp; (void)window;
+    (void)ratio; (void)n_head; (void)head_dim; (void)n_rot;
+    return 0;
+}

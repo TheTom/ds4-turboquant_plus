@@ -18853,14 +18853,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
+    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers
+     * are linker-only stubs.  Reject early with a clear message so the
+     * user picks a supported (backend, dtype) combo instead of silently
+     * falling through to fp8 mid-run.  Phase 4 follow-up will port the
+     * turbo4/turbo2 kernels back to CUDA (atlas branch has the
+     * reference implementations). */
+    if (e->backend == DS4_BACKEND_CUDA &&
+        (e->kv_dtype == DS4_KV_TURBO4 || e->kv_dtype == DS4_KV_TURBO2)) {
+        fprintf(stderr,
+                "ds4: --kv-cache %s is Metal-only in this build; "
+                "use --backend metal or --kv-cache {fp8,turbo3}\n",
+                ds4_kv_dtype_name(e->kv_dtype));
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     ds4_kv_set_active_dtype(e->kv_dtype);
-    /* turbo3 KV on Metal: Phase 2b Wave M0-M2 ships pack/dequant +
-     * float-sim quantize round trip.  The Phase 2b inline-dequant
-     * attention kernels are CUDA-only; on Metal the launchers return 0
-     * and ds4.c's existing fallback paths use view_dispatch (dequant
-     * to scratch) + the stock Metal fp8 attention kernels.  Correct
-     * with full 4.75x memory savings on Metal; inline-dequant perf
-     * parity is future Wave M3+ work. */
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
