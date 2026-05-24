@@ -18922,21 +18922,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
     e->comp_dtype = opt->comp_dtype;
-    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers are
-     * linker-only stubs.  Reject early with a clear message so the user
-     * picks a supported (backend, dtype) combo instead of silently
-     * falling through to fp8 mid-run.  Phase 4 follow-up will port the
-     * turbo4/turbo2 kernels back to CUDA. */
-    if (e->backend == DS4_BACKEND_CUDA &&
-        (e->kv_dtype == DS4_KV_TURBO4 || e->kv_dtype == DS4_KV_TURBO2)) {
-        fprintf(stderr,
-                "ds4: --kv-cache %s is Metal-only in this build; "
-                "use --backend metal or --kv-cache {fp8,turbo3}\n",
-                ds4_kv_dtype_name(e->kv_dtype));
-        free(e);
-        *out = NULL;
-        return 1;
-    }
+    /* Phase 4: turbo4 + turbo2 ship CUDA implementations alongside the
+     * Metal kernels (Phase 3).  All combos of {fp8, turbo3, turbo4,
+     * turbo2} x {metal, cuda} are now supported.  The CUDA path uses
+     * the pack/dequant/quantize kernels with view_dispatch fallback for
+     * attention (inline-dequant attention is Phase 4.2+, optional). */
     /* --comp-cache turbo3 is CUDA + CPU only as of Phase 3a foundation —
      * Metal wire-up of the compressed comp pool is Phase 7+ work. */
     if (e->backend == DS4_BACKEND_METAL && e->comp_dtype == DS4_KV_TURBO3) {
