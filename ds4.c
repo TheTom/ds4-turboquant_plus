@@ -8928,6 +8928,12 @@ typedef struct {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_N_LAYER];
+    /* Phase 7.1: packed companion of layer_attn_comp_cache when
+     * comp_dtype=turbo3.  Allocated alongside (not in place of) the
+     * float pool — Phase 7.1 only validates the allocator can satisfy
+     * the request.  Phase 7.2 wires the compressor pack write path;
+     * Phase 7.4 drops the float pool entirely. */
+    ds4_gpu_tensor *layer_attn_comp_cache_packed[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_N_LAYER];
@@ -9220,6 +9226,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache_packed[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
@@ -9675,6 +9684,16 @@ static bool metal_graph_alloc_raw_cap(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+            /* Phase 7.1: packed companion pool when --comp-cache turbo3.
+             * No writes/reads yet; this is just an allocator sanity check
+             * for the packed-byte stride before Phase 7.2 wires the
+             * compressor pack path. */
+            if (g_ds4_comp_dtype == DS4_KV_TURBO3) {
+                const uint64_t comp_row_bytes = ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+                g->layer_attn_comp_cache_packed[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
+            }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
