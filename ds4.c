@@ -10868,15 +10868,33 @@ static bool metal_graph_encode_decode_layer(
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
             int rc = 0;
             if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
-                rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
+                /* Phase 6: try the h8 head-batched Flash kernel first (env-
+                 * gated, off by default).  Returns 0 if disabled or
+                 * unsupported config -> falls back to Wave M3 launcher. */
+                rc = ds4_gpu_attention_decode_h8_turbo3_tensor(
                         g->heads, model->map, model->size,
                         layer->attn_sinks->abs_offset,
-                        g->q, raw_cache, row_bytes, n_raw,
-                        raw_cap, raw_start,
+                        g->q, raw_cache, row_bytes,
                         n_comp ? comp_cache : NULL,
                         metal_graph_attn_comp_cache_is_f16(),
-                        n_comp, NULL, 0,
+                        NULL, 0,
+                        /* n_tokens */ 1u,
+                        /* pos0    */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window  */ 0u,
+                        /* ratio   */ 0u,
                         DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
             } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
                 rc = ds4_gpu_attention_decode_heads_turbo4_tensor(
                         g->heads, model->map, model->size,
