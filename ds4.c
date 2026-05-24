@@ -18897,18 +18897,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
-    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers
-     * are linker-only stubs.  Reject early with a clear message so the
-     * user picks a supported (backend, dtype) combo instead of silently
-     * falling through to fp8 mid-run.  Phase 4 follow-up will port the
-     * turbo4/turbo2 kernels back to CUDA (atlas branch has the
-     * reference implementations). */
-    if (e->backend == DS4_BACKEND_CUDA &&
-        (e->kv_dtype == DS4_KV_TURBO4 || e->kv_dtype == DS4_KV_TURBO2)) {
+    /* turbo2 CUDA support is opt-in and ships behind link-time stubs.
+     * Reject early with a clear message so the user picks a supported
+     * (backend, dtype) combo instead of silently falling through to fp8
+     * mid-run.  turbo4 has a real CUDA implementation (see Section G
+     * pack/dequant + inline-dequant attention decode); allow it. */
+    if (e->backend == DS4_BACKEND_CUDA && e->kv_dtype == DS4_KV_TURBO2) {
         fprintf(stderr,
-                "ds4: --kv-cache %s is Metal-only in this build; "
-                "use --backend metal or --kv-cache {fp8,turbo3}\n",
-                ds4_kv_dtype_name(e->kv_dtype));
+                "ds4: --kv-cache turbo2 is Metal-only in this build; "
+                "use --backend metal or --kv-cache {fp8,turbo3,turbo4}\n");
         free(e);
         *out = NULL;
         return 1;
