@@ -13132,6 +13132,22 @@ static bool metal_graph_encode_layer_attention_batch(
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
                         }
                     }
+                    /* Phase 7.2: dual-write packed companion for the chunked
+                     * prefill path.  Pack the float rows just written
+                     * (comp_chunk rows starting at comp_before) into the
+                     * packed pool at the matching row offset. */
+                    if (g_ds4_comp_dtype == DS4_KV_TURBO3 &&
+                        g->layer_attn_comp_cache_packed[il] != NULL && comp_chunk != 0) {
+                        const uint64_t comp_row_bytes =
+                                ds4_comp_row_bytes(DS4_N_HEAD_DIM, DS4_KV_TURBO3);
+                        ok = ds4_gpu_dsv4_turbo3_comp_pack_tensor(
+                                attn_comp_target,
+                                g->layer_attn_comp_cache_packed[il],
+                                comp_chunk,
+                                /* dst_first_row */ (uint64_t)comp_before,
+                                DS4_N_HEAD_DIM,
+                                comp_row_bytes) != 0;
+                    }
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   attn_comp_target,
                                                   (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
