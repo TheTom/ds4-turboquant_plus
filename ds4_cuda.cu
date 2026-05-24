@@ -2507,6 +2507,181 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TurboQuant+ turbo3 KV quality simulation — CUDA kernel.
+//
+// Sibling of fp8_kv_quantize_kernel above; same in-place [n_tok, head_dim]
+// contract; same group-of-64 cadence on the first head_dim - n_rot elements;
+// RoPE tail untouched.  Per group:
+//   1. forward Randomized Hadamard: signs1 (Rademacher) → 64-point WHT
+//      → 1/sqrt(64) → signs2 (Rademacher).
+//   2. block-wide amax + sum-of-squares reduction (warp shfl in two halves).
+//   3. amax → scale into 3-bit Lloyd-Max codebook range for N(0,1).
+//   4. per-element quantize to nearest centroid; block-wide reduction on the
+//      centroid recon L2 norm to compute the matched-norm scale
+//      (||original|| / ||centroid_recon||) — same MSE-vs-amax trick used in
+//      reshape_and_cache_flash_turbo3 in atlas/kernels/gb10/common/.
+//   5. dequantize centroid * matched-norm scale.
+//   6. inverse rotation: signs2 → WHT → 1/sqrt(64) → signs1.
+//
+// Grid: <<<n_tok, 64>>>.  One block per token, one thread per element of the
+// 64-element group; the per-token outer loop walks each group sequentially so
+// we reuse shared scratch buffers across groups.  64 threads = exactly two
+// warps, so block-wide reductions go warp-shfl-first then a 2-element shared
+// merge.  No __syncwarp() needed — shfl_xor_sync covers the whole warp.
+//
+// Prior art: TheTom/llama-cpp-turboquant turbo-wht.cu (sign convention +
+// matched-norm L2 trick) and Atlas kernels/gb10/common/reshape_and_cache_turbo.cu
+// (Lloyd-Max codebook + bound table).  See CITATIONS chain in ds4.c near
+// dsv4_turbo3_kv_quantize_row_inplace_cpu for the full attribution.
+
+// Lloyd-Max 8-level codebook for N(0,1).  Byte-equivalent to the CPU table
+// DS4_TURBO3_CODEBOOK in ds4.c.
+__device__ __constant__ float DS4_TURBO3_CODEBOOK_D[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3440f, 2.1520f
+};
+__device__ __constant__ float DS4_TURBO3_BOUNDS_D[7] = {
+    -1.748f, -1.050f, -0.501f, 0.0f, 0.501f, 1.050f, 1.748f
+};
+
+// Two-sided Rademacher signs for the 64-point WHT.  Byte-equivalent to the CPU
+// tables DS4_TURBO_SIGNS{1,2}_64 in ds4.c — see that file for the seed=42 /
+// seed=142 Pythons random.Random Bernoulli(0.5) recipe.
+__device__ __constant__ float DS4_TURBO_SIGNS1_64_D[64] = {
+    +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, +1.0f,
+    +1.0f, +1.0f, -1.0f, +1.0f, +1.0f, +1.0f, +1.0f, +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+    +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, +1.0f,
+};
+__device__ __constant__ float DS4_TURBO_SIGNS2_64_D[64] = {
+    +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, +1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, -1.0f, -1.0f,
+    +1.0f, +1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+};
+
+// FP8 E4M3 max representable — used to clamp the matched-norm scale so a
+// future Metal port can pack the per-group scale into one FP8 byte without an
+// extra renormalization pass.
+#define DS4_FP8_E4M3_MAX_D 448.0f
+#define DS4_TURBO3_MAX_D   2.1520f
+
+// In-shared-memory 64-element WHT butterfly.  Caller owns the buffer + sync.
+// Identical structure to dsv4_turbo3_wht64_inplace_cpu in ds4.c — but
+// parallelized across the 64 threads of the block by halving the active thread
+// set at each butterfly stride.  Compatible with VRAM access pattern: every
+// thread reads/writes a unique element each stride.
+__device__ __forceinline__ void wht64_block(float *v, uint32_t tid) {
+    for (uint32_t stride = 1; stride < 64; stride <<= 1) {
+        // Half the threads do the butterfly write; tid bit at `stride` selects
+        // which side of the pair the thread owns.
+        uint32_t mate = tid ^ stride;
+        bool is_low = (tid & stride) == 0;
+        float self = v[tid];
+        __syncthreads();
+        float other = v[mate];
+        float out = is_low ? (self + other) : (other - self);
+        __syncthreads();
+        v[tid] = out;
+        __syncthreads();
+    }
+}
+
+// Nearest-centroid 3-bit index lookup against DS4_TURBO3_BOUNDS_D.
+__device__ __forceinline__ unsigned int turbo3_quant_idx(float x) {
+    unsigned int idx;
+    if (x >= DS4_TURBO3_BOUNDS_D[3]) {
+        idx = 4;
+        if (x >= DS4_TURBO3_BOUNDS_D[5]) { idx = 6; if (x >= DS4_TURBO3_BOUNDS_D[6]) idx = 7; }
+        else if (x >= DS4_TURBO3_BOUNDS_D[4]) idx = 5;
+    } else {
+        idx = 0;
+        if (x >= DS4_TURBO3_BOUNDS_D[1]) { idx = 2; if (x >= DS4_TURBO3_BOUNDS_D[2]) idx = 3; }
+        else if (x >= DS4_TURBO3_BOUNDS_D[0]) idx = 1;
+    }
+    return idx;
+}
+
+// Block-wide max via warp-shuffle then shared-memory cross-warp merge.  64
+// threads = 2 warps; one shared slot per warp.  Returns the broadcast value.
+__device__ __forceinline__ float block_max64(float v, uint32_t tid) {
+    __shared__ float warp_max[2];
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, off));
+    if ((tid & 31u) == 0u) warp_max[tid >> 5] = v;
+    __syncthreads();
+    float r = fmaxf(warp_max[0], warp_max[1]);
+    return r;
+}
+
+__device__ __forceinline__ float block_sum64(float v, uint32_t tid) {
+    __shared__ float warp_sum[2];
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+    if ((tid & 31u) == 0u) warp_sum[tid >> 5] = v;
+    __syncthreads();
+    float r = warp_sum[0] + warp_sum[1];
+    return r;
+}
+
+// signs_on=1 (default): canonical Randomized Hadamard.  signs_on=0: plain WHT
+// for A/B diagnostics — strictly weaker, kept callable via DS4_TURBO_NO_SIGNS
+// env var by the host wrapper.
+__global__ static void turbo3_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot, int signs_on) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_tok) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    float *xr = x + (uint64_t)row * head_dim;
+
+    __shared__ float buf[64];
+    // 1/sqrt(64); spelled via sqrtf so the literal divide is unambiguously
+    // float-by-float for static analysis tools.
+    const float inv_sqrt_n = rsqrtf(64.0f);
+
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        // Load: one element per thread.  If we ever change n_nope to not be
+        // 64-aligned the OOB path mirrors fp8_kv_quantize_kernel's tail (zero
+        // pad) — for DS4_N_HEAD_DIM=512, DS4_N_ROT=64, n_nope=448 is exactly
+        // 7 groups of 64 so the tail logic is unused here.
+        float v = (off + tid < n_nope) ? xr[off + tid] : 0.0f;
+        if (signs_on) v *= DS4_TURBO_SIGNS1_64_D[tid];
+        buf[tid] = v;
+        __syncthreads();
+
+        // 1. forward WHT + normalize
+        wht64_block(buf, tid);
+        float rotated = buf[tid] * inv_sqrt_n;
+        if (signs_on) rotated *= DS4_TURBO_SIGNS2_64_D[tid];
+
+        // 2. block-wide amax and L2 norm of rotated group
+        float amax = block_max64(fabsf(rotated), tid);
+        float norm_sq = block_sum64(rotated * rotated, tid);
+        float k_inv = (amax > 1e-12f) ? (DS4_TURBO3_MAX_D / amax) : 1.0f;
+
+        // 3. quantize, reduce centroid recon L2 norm, derive matched-norm scale
+        unsigned int idx = turbo3_quant_idx(rotated * k_inv);
+        float centroid = DS4_TURBO3_CODEBOOK_D[idx];
+        float recon_sq = block_sum64(centroid * centroid, tid);
+        float recon_norm = sqrtf(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrtf(norm_sq) / recon_norm) : (amax / DS4_TURBO3_MAX_D);
+        if (scale > DS4_FP8_E4M3_MAX_D) scale = DS4_FP8_E4M3_MAX_D;
+
+        // 4. dequant in rotated basis
+        float dequant = centroid * scale;
+
+        // 5. inverse rotation: signs2 → WHT → 1/sqrt(64) → signs1
+        if (signs_on) dequant *= DS4_TURBO_SIGNS2_64_D[tid];
+        __syncthreads();
+        buf[tid] = dequant;
+        __syncthreads();
+        wht64_block(buf, tid);
+        float final_v = buf[tid] * inv_sqrt_n;
+        if (signs_on) final_v *= DS4_TURBO_SIGNS1_64_D[tid];
+
+        if (off + tid < n_nope) xr[off + tid] = final_v;
+        __syncthreads();
+    }
+}
+
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
@@ -6346,6 +6521,28 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
+
+// Cached env query for the diagnostic no-signs switch.  Mirrors the CPU
+// helper in ds4.c; one strcmp on first call, value frozen for the process.
+static int ds4_turbo_signs_enabled_dev(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("DS4_TURBO_NO_SIGNS");
+        cached = (s && s[0] && !(s[0] == '0' && s[1] == 0)) ? 0 : 1;
+    }
+    return cached;
+}
+
+extern "C" int ds4_gpu_dsv4_turbo3_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+    if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    if (n_tok == 0) return 1;
+    // Grid mirrors fp8_kv_quantize_kernel: one block per token, 64 threads.
+    // turbo3_kv_quantize_kernel walks the n_nope dimension internally in
+    // groups of 64, applying the WHT + signs + Lloyd-Max + matched-norm round
+    // trip on each.  RoPE tail untouched.
+    turbo3_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot, ds4_turbo_signs_enabled_dev());
+    return cuda_ok(cudaGetLastError(), "turbo3_kv_quantize launch");
+}
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
@@ -6369,6 +6566,17 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot) {
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
+           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+}
+
+extern "C" int ds4_gpu_kv_turbo3_store_raw_tensor(
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t          raw_cap,
+        uint32_t          raw_row,
+        uint32_t          head_dim,
+        uint32_t          n_rot) {
+    return ds4_gpu_dsv4_turbo3_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
            ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
