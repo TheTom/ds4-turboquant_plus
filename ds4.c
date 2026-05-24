@@ -2120,14 +2120,7 @@ static DS4_MAYBE_UNUSED void dsv4_turbo3_kv_unpack_row_cpu(
  * or fence is required. */
 static ds4_kv_dtype g_ds4_kv_dtype = DS4_KV_FP8;
 
-/* Phase 3a: compressed-cache dtype.  Distinct from g_ds4_kv_dtype so ds4-asym
- * (raw=turbo3 + comp=fp8, or raw=fp8 + comp=turbo3, etc.) is expressible.
- * Default DS4_KV_FP8 preserves the historical float-sim path; DS4_KV_TURBO3
- * packs comp rows to 200 B (10.24x vs float, 5.12x vs f16 staging). */
-static ds4_kv_dtype g_ds4_comp_dtype = DS4_KV_FP8;
-
 static void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype; }
-static void ds4_comp_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_comp_dtype = dtype; }
 
 /* Dtype-aware in-place round trip on one MLA latent KV row.  Picks the FP8 or
  * turbo3 path based on the engine-wide dtype set at open time. */
@@ -2234,21 +2227,6 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
         const uint64_t scale_bytes = (uint64_t)n_groups;
         const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
         return data_bytes + scale_bytes + rope_bytes;
-    }
-    return (uint64_t)head_dim * sizeof(float);
-}
-
-/* Phase 3a: row byte size for the per-layer compressed cache.  No RoPE tail
- * (compressor output is the full head_dim).  At head_dim=512:
- *   fp8  (float-sim): 512 * 4 = 2048 bytes/row
- *   turbo3 (packed) : 512 * 3 / 8 + 512 / 64 = 192 + 8 = 200 bytes/row
- *                     -> 10.24x smaller per row */
-uint64_t ds4_comp_row_bytes(uint32_t head_dim, ds4_kv_dtype dtype) {
-    if (dtype == DS4_KV_TURBO3) {
-        const uint32_t n_groups = (head_dim + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
-        const uint64_t data_bytes = ((uint64_t)head_dim * 3u + 7u) / 8u;
-        const uint64_t scale_bytes = (uint64_t)n_groups;
-        return data_bytes + scale_bytes;
     }
     return (uint64_t)head_dim * sizeof(float);
 }
@@ -15607,8 +15585,6 @@ struct ds4_engine {
      * Set once at engine open from ds4_engine_options.kv_dtype; immutable
      * thereafter so cache values within a session stay consistent. */
     ds4_kv_dtype kv_dtype;
-    /* Phase 3a: comp cache dtype, independent of kv_dtype. */
-    ds4_kv_dtype comp_dtype;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -18600,17 +18576,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
-    e->comp_dtype = opt->comp_dtype;
     ds4_kv_set_active_dtype(e->kv_dtype);
-    ds4_comp_set_active_dtype(e->comp_dtype);
     /* turbo3 KV is CUDA + CPU reference only.  Metal kernel is deferred — the
      * Metal stubs print a one-line error if reached, but we fail fast here so
      * the user sees a clean message at engine open rather than mid-decode. */
-    if ((e->kv_dtype == DS4_KV_TURBO3 || e->comp_dtype == DS4_KV_TURBO3) &&
-        e->backend == DS4_BACKEND_METAL) {
+    if (e->kv_dtype == DS4_KV_TURBO3 && e->backend == DS4_BACKEND_METAL) {
         fprintf(stderr,
-            "ds4: --kv-cache turbo3 / --comp-cache turbo3 are not available on the Metal backend yet; "
-            "use the fp8 defaults or run with --cuda or --cpu\n");
+            "ds4: --kv-cache turbo3 is not available on the Metal backend yet; "
+            "use --kv-cache fp8 (default) or run with --cuda or --cpu\n");
         free(e);
         *out = NULL;
         return 1;

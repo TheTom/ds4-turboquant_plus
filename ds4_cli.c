@@ -112,10 +112,6 @@ static void usage(FILE *fp) {
         "      swaps in a TurboQuant+ Randomized Hadamard rotation + 3-bit Lloyd-Max\n"
         "      Lloyd-Max quantization with matched-norm L2 correction on the same 64-element\n"
         "      groups. Storage layout unchanged. CUDA-only at the moment; Metal port deferred.\n"
-        "  --comp-cache fp8|turbo3\n"
-        "      Compressed-cache dtype. Phase 3a (ds4-asym): packs the per-layer\n"
-        "      attn_comp_cache to turbo3 bytes (10.24x vs float). Default fp8.\n"
-        "      Independent of --kv-cache so all four combos are expressible. CUDA-only.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1467,12 +1463,6 @@ static cli_config parse_options(int argc, char **argv) {
             const char *kv_name = need_arg(&i, argc, argv, arg);
             if (!ds4_kv_dtype_from_name(kv_name, &c.engine.kv_dtype)) {
                 fprintf(stderr, "ds4: unknown --kv-cache value '%s' (expected fp8 or turbo3)\n", kv_name);
-                exit(1);
-            }
-        } else if (!strcmp(arg, "--comp-cache")) {
-            const char *cc_name = need_arg(&i, argc, argv, arg);
-            if (!ds4_kv_dtype_from_name(cc_name, &c.engine.comp_dtype)) {
-                fprintf(stderr, "ds4: unknown --comp-cache value '%s' (expected fp8 or turbo3)\n", cc_name);
                 exit(1);
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
