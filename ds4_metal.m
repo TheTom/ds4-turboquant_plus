@@ -93,6 +93,14 @@ static id<MTLComputePipelineState> g_dsv4_turbo4_kv_pack_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo4_kv_pack_batch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_turbo4_kv_dequant_to_scratch_pipeline;
 static id<MTLComputePipelineState> g_dsv4_attention_decode_mixed_turbo4_pipeline;
+/* turbo2 siblings — 2-bit Lloyd-Max ultra-compression. */
+static id<MTLComputePipelineState> g_dsv4_turbo2_kv_pack_batch_pipeline;
+static id<MTLComputePipelineState> g_dsv4_turbo2_kv_dequant_to_scratch_pipeline;
+static id<MTLComputePipelineState> g_dsv4_attention_decode_mixed_turbo2_pipeline;
+/* Phase 6 — head-batched Flash attention with online softmax. */
+static id<MTLComputePipelineState> g_dsv4_attention_decode_h8_turbo3_pipeline;
+static id<MTLComputePipelineState> g_dsv4_attention_decode_h8_turbo4_pipeline;
+static id<MTLComputePipelineState> g_dsv4_attention_decode_h8_turbo2_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
@@ -3326,6 +3334,12 @@ int ds4_gpu_init(void) {
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo4_kv_pack_batch_f32",          g_dsv4_turbo4_kv_pack_batch_pipeline);
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo4_kv_dequant_to_scratch_f32",  g_dsv4_turbo4_kv_dequant_to_scratch_pipeline);
         DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_mixed_turbo4_f32", g_dsv4_attention_decode_mixed_turbo4_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo2_kv_pack_batch_f32",          g_dsv4_turbo2_kv_pack_batch_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_turbo2_kv_dequant_to_scratch_f32",  g_dsv4_turbo2_kv_dequant_to_scratch_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_mixed_turbo2_f32", g_dsv4_attention_decode_mixed_turbo2_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_h8_turbo3_f32",    g_dsv4_attention_decode_h8_turbo3_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_h8_turbo4_f32",    g_dsv4_attention_decode_h8_turbo4_pipeline);
+        DS4_LOAD_T4_PIPELINE("kernel_dsv4_attention_decode_h8_turbo2_f32",    g_dsv4_attention_decode_h8_turbo2_pipeline);
         #undef DS4_LOAD_T4_PIPELINE
 
         fn = [library newFunctionWithName:@"kernel_dsv4_indexer_hadamard_fp4_f32"];
@@ -4593,6 +4607,12 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_turbo4_kv_pack_batch_pipeline = nil;
         g_dsv4_turbo4_kv_dequant_to_scratch_pipeline = nil;
         g_dsv4_attention_decode_mixed_turbo4_pipeline = nil;
+        g_dsv4_turbo2_kv_pack_batch_pipeline = nil;
+        g_dsv4_turbo2_kv_dequant_to_scratch_pipeline = nil;
+        g_dsv4_attention_decode_mixed_turbo2_pipeline = nil;
+        g_dsv4_attention_decode_h8_turbo3_pipeline = nil;
+        g_dsv4_attention_decode_h8_turbo4_pipeline = nil;
+        g_dsv4_attention_decode_h8_turbo2_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_ratio4_shift_pipeline = nil;
@@ -7375,6 +7395,654 @@ int ds4_gpu_attention_prefill_raw_turbo4_heads_tensor(
     (void)raw_kv_bytes; (void)row_bytes; (void)n_tokens; (void)window;
     (void)n_head; (void)head_dim; (void)n_rot;
     return 0;
+}
+
+/* =========================================================================
+ * turbo2 (2-bit Lloyd-Max) launchers — opt-in ultra-compression.
+ * No inline-dequant attention kernel; always uses M1 dequant-to-scratch
+ * fallback + the existing fp8 attention kernels.  Quantize delegates to
+ * the FP8 fallback (same reason as turbo3/4 in-place quant).
+ * ========================================================================= */
+
+int ds4_gpu_dsv4_turbo2_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot) {
+    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
+}
+
+int ds4_gpu_dsv4_turbo2_kv_dequant_to_scratch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *dst,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              src_row_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!src || !dst || n_rows == 0 || n_rot > head_dim) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)src);
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
+        if (!sbuf || !dbuf) return 0;
+        if (ds4_gpu_tensor_bytes(src) < (uint64_t)n_rows * src_row_bytes) return 0;
+        if (ds4_gpu_tensor_bytes(dst) < (uint64_t)n_rows * head_dim * sizeof(float)) return 0;
+
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo2_kv_dequant_to_scratch_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(dst) atIndex:1];
+        [enc setBytes:&n_rows        length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&head_dim      length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n_rot         length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&src_row_bytes length:sizeof(uint64_t) atIndex:5];
+        [enc setBytes:&signs_on      length:sizeof(int)      atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo2 KV dequant")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
+        const ds4_gpu_tensor *src,
+        ds4_gpu_tensor       *raw,
+        uint32_t              raw_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint64_t              row_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!src || !raw || raw_cap == 0 || n_rot > head_dim) return 0;
+    if (n_tokens == 0) return 1;
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)src);
+        id<MTLBuffer> rbuf = ds4_gpu_tensor_buffer(raw);
+        if (!sbuf || !rbuf) return 0;
+        if (ds4_gpu_tensor_bytes(src) < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+        if (ds4_gpu_tensor_bytes(raw) < (uint64_t)raw_cap * row_bytes) return 0;
+
+        const int signs_on = 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_turbo2_kv_pack_batch_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:rbuf offset:ds4_gpu_tensor_offset(raw) atIndex:1];
+        [enc setBytes:&raw_cap   length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&pos0      length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n_tokens  length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&head_dim  length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&n_rot     length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&row_bytes length:sizeof(uint64_t) atIndex:7];
+        [enc setBytes:&signs_on  length:sizeof(int)      atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo2 KV pack batch")) return 0;
+    }
+    return 1;
+}
+
+struct ds4_metal_args_attn_decode_mixed_turbo2 {
+    uint64_t row_bytes;
+    uint32_t use_comp_mask;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    int      signs_on;
+};
+
+int ds4_gpu_attention_decode_mixed_batch_turbo2_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    static int wave_m3_disable = -1;
+    if (wave_m3_disable < 0) {
+        const char *e = getenv("DS4_METAL_TURBO2_NO_INLINE");
+        wave_m3_disable = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (wave_m3_disable) return 0;
+    if (!heads || !model_map || !q || !raw_kv_bytes ||
+        head_dim != 512u || n_rot != 64u || n_tokens != 1u ||
+        comp_kv_f16 != 1u || raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_comp != 0u && !comp_kv) ||
+        (use_comp_mask != 0u && !comp_mask)) {
+        return 0;
+    }
+    if (n_raw > 256u) return 0;
+    static int inline_thresh = -1;
+    if (inline_thresh < 0) {
+        const char *e = getenv("DS4_METAL_TURBO2_INLINE_THRESH");
+        inline_thresh = (e && e[0]) ? atoi(e) : 96;
+        if (inline_thresh < 0) inline_thresh = 0;
+    }
+    if ((int)n_raw > inline_thresh) return 0;
+
+    @autoreleasepool {
+        if (sinks_offset > model_size ||
+            (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal turbo2 decode sinks range out of mapped model\n");
+            return 0;
+        }
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                          sinks_offset,
+                                                          (uint64_t)n_head * sizeof(float),
+                                                          &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> qbuf     = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)q);
+        id<MTLBuffer> rawbuf   = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)raw_kv_bytes);
+        id<MTLBuffer> compbuf  = (n_comp != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_kv) : rawbuf;
+        id<MTLBuffer> maskbuf  = (use_comp_mask != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_mask) : rawbuf;
+        NSUInteger comp_off    = (n_comp != 0u) ? ds4_gpu_tensor_offset(comp_kv) : 0;
+        NSUInteger mask_off    = (use_comp_mask != 0u) ? ds4_gpu_tensor_offset(comp_mask) : 0;
+        if (!headsbuf || !qbuf || !rawbuf || !compbuf || !maskbuf) return 0;
+
+        const uint64_t out_bytes  = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+        const uint64_t q_bytes    = out_bytes;
+        const uint64_t raw_bytes  = (uint64_t)raw_cap * row_bytes;
+        if (ds4_gpu_tensor_bytes(heads) < out_bytes ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(raw_kv_bytes) < raw_bytes) {
+            fprintf(stderr, "ds4: Metal turbo2 decode received undersized buffers\n");
+            return 0;
+        }
+
+        struct ds4_metal_args_attn_decode_mixed_turbo2 args = {
+            .row_bytes      = row_bytes,
+            .use_comp_mask  = use_comp_mask,
+            .n_tokens       = n_tokens,
+            .pos0           = pos0,
+            .n_raw          = n_raw,
+            .raw_cap        = raw_cap,
+            .raw_start      = raw_start,
+            .n_comp         = n_comp,
+            .window         = window,
+            .ratio          = ratio,
+            .n_head         = n_head,
+            .head_dim       = head_dim,
+            .n_rot          = n_rot,
+            .signs_on       = 1,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_attention_decode_mixed_turbo2_pipeline];
+        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:0];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:1];
+        [enc setBuffer:qbuf      offset:ds4_gpu_tensor_offset(q)  atIndex:2];
+        [enc setBuffer:rawbuf    offset:ds4_gpu_tensor_offset(raw_kv_bytes) atIndex:3];
+        [enc setBuffer:compbuf   offset:comp_off atIndex:4];
+        [enc setBuffer:maskbuf   offset:mask_off atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 turbo2 decode mixed attention")) return 0;
+    }
+    return 1;
+}
+
+/* Phase 6 — head-batched (h8) Flash attention with online softmax.  Single
+ * dequant pass per row tile reused across 8 heads.  POC v1 uses simd_sum
+ * for K-dot (no simdgroup_matrix yet).  Gated entirely behind env
+ * DS4_METAL_TURBO3_H8=1 — defaults off so existing Wave M3 path is the
+ * production behavior until h8 is bench-validated.  Returns 0 when env
+ * is unset (caller falls back to the existing Wave M3 launcher). */
+struct ds4_metal_args_attn_h8_turbo3 {
+    uint64_t row_bytes;
+    uint32_t use_comp_mask;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    int      signs_on;
+};
+
+int ds4_gpu_attention_decode_h8_turbo3_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Phase 6.4: h8 default-ON for turbo3 — PPL drift is within fp8-noise
+     * (<0.5% at 1024 tokens) and short-context decode wins +20% vs Wave
+     * M3.  Set DS4_METAL_TURBO3_H8=0 to disable and fall back to Wave M3. */
+    static int h8_enable = -1;
+    if (h8_enable < 0) {
+        const char *e = getenv("DS4_METAL_TURBO3_H8");
+        h8_enable = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    if (!h8_enable) return 0;
+    /* h8 kernel hard-codes head_dim=512, n_rot=64, n_head%8==0, single-
+     * token decode, f16 comp_kv.  Anything else falls back to caller. */
+    if (!heads || !model_map || !q || !raw_kv_bytes ||
+        head_dim != 512u || n_rot != 64u || n_tokens != 1u ||
+        comp_kv_f16 != 1u || raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_head & 7u) != 0u ||
+        (n_comp != 0u && !comp_kv) ||
+        (use_comp_mask != 0u && !comp_mask)) {
+        return 0;
+    }
+    if (n_raw > 256u) return 0;
+    /* Gate: h8 wins at short context (n_raw<=~96) but loses to the M1
+     * simdgroup_matrix fp8 attention fallback at long context.  Override
+     * via DS4_METAL_TURBO3_H8_THRESH (0 = always M3+M1 path). */
+    static int h8_thresh = -1;
+    if (h8_thresh < 0) {
+        const char *e = getenv("DS4_METAL_TURBO3_H8_THRESH");
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
+        if (h8_thresh < 0) h8_thresh = 0;
+    }
+    if ((int)n_raw > h8_thresh) return 0;
+
+    @autoreleasepool {
+        if (sinks_offset > model_size ||
+            (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal h8 turbo3 decode sinks range out of mapped model\n");
+            return 0;
+        }
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                          sinks_offset,
+                                                          (uint64_t)n_head * sizeof(float),
+                                                          &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> qbuf     = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)q);
+        id<MTLBuffer> rawbuf   = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)raw_kv_bytes);
+        id<MTLBuffer> compbuf  = (n_comp != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_kv) : rawbuf;
+        id<MTLBuffer> maskbuf  = (use_comp_mask != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_mask) : rawbuf;
+        NSUInteger comp_off    = (n_comp != 0u) ? ds4_gpu_tensor_offset(comp_kv) : 0;
+        NSUInteger mask_off    = (use_comp_mask != 0u) ? ds4_gpu_tensor_offset(comp_mask) : 0;
+        if (!headsbuf || !qbuf || !rawbuf || !compbuf || !maskbuf) return 0;
+
+        struct ds4_metal_args_attn_h8_turbo3 args = {
+            .row_bytes      = row_bytes,
+            .use_comp_mask  = use_comp_mask,
+            .n_tokens       = n_tokens,
+            .pos0           = pos0,
+            .n_raw          = n_raw,
+            .raw_cap        = raw_cap,
+            .raw_start      = raw_start,
+            .n_comp         = n_comp,
+            .window         = window,
+            .ratio          = ratio,
+            .n_head         = n_head,
+            .head_dim       = head_dim,
+            .n_rot          = n_rot,
+            .signs_on       = 1,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_attention_decode_h8_turbo3_pipeline];
+        [enc setBuffer:headsbuf  offset:ds4_gpu_tensor_offset(heads) atIndex:0];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner       atIndex:1];
+        [enc setBuffer:qbuf      offset:ds4_gpu_tensor_offset(q)      atIndex:2];
+        [enc setBuffer:rawbuf    offset:ds4_gpu_tensor_offset(raw_kv_bytes) atIndex:3];
+        [enc setBuffer:compbuf   offset:comp_off atIndex:4];
+        [enc setBuffer:maskbuf   offset:mask_off atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        /* Grid: (n_tokens, n_head/8, 1), threads: 256. */
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 h8 turbo3 decode attention")) return 0;
+    }
+    return 1;
+}
+
+/* h8 sibling for turbo4 — clone of turbo3 path with different pipeline +
+ * env name (DS4_METAL_TURBO4_H8 / DS4_METAL_TURBO4_H8_THRESH). */
+struct ds4_metal_args_attn_h8_turbo4 {
+    uint64_t row_bytes;
+    uint32_t use_comp_mask;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    int      signs_on;
+};
+
+int ds4_gpu_attention_decode_h8_turbo4_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Phase 6.4: h8 default-ON for turbo4 (same rationale as turbo3 —
+     * PPL drift within fp8-noise, +20% short decode).  Disable via
+     * DS4_METAL_TURBO4_H8=0. */
+    static int h8_enable = -1;
+    if (h8_enable < 0) {
+        const char *e = getenv("DS4_METAL_TURBO4_H8");
+        h8_enable = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    if (!h8_enable) return 0;
+    if (!heads || !model_map || !q || !raw_kv_bytes ||
+        head_dim != 512u || n_rot != 64u || n_tokens != 1u ||
+        comp_kv_f16 != 1u || raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_head & 7u) != 0u ||
+        (n_comp != 0u && !comp_kv) ||
+        (use_comp_mask != 0u && !comp_mask)) {
+        return 0;
+    }
+    if (n_raw > 256u) return 0;
+    static int h8_thresh = -1;
+    if (h8_thresh < 0) {
+        const char *e = getenv("DS4_METAL_TURBO4_H8_THRESH");
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
+        if (h8_thresh < 0) h8_thresh = 0;
+    }
+    if ((int)n_raw > h8_thresh) return 0;
+
+    @autoreleasepool {
+        if (sinks_offset > model_size ||
+            (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal h8 turbo4 decode sinks range out of mapped model\n");
+            return 0;
+        }
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                          sinks_offset,
+                                                          (uint64_t)n_head * sizeof(float),
+                                                          &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> qbuf     = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)q);
+        id<MTLBuffer> rawbuf   = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)raw_kv_bytes);
+        id<MTLBuffer> compbuf  = (n_comp != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_kv) : rawbuf;
+        id<MTLBuffer> maskbuf  = (use_comp_mask != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_mask) : rawbuf;
+        NSUInteger comp_off    = (n_comp != 0u) ? ds4_gpu_tensor_offset(comp_kv) : 0;
+        NSUInteger mask_off    = (use_comp_mask != 0u) ? ds4_gpu_tensor_offset(comp_mask) : 0;
+        if (!headsbuf || !qbuf || !rawbuf || !compbuf || !maskbuf) return 0;
+
+        struct ds4_metal_args_attn_h8_turbo4 args = {
+            .row_bytes      = row_bytes,
+            .use_comp_mask  = use_comp_mask,
+            .n_tokens       = n_tokens,
+            .pos0           = pos0,
+            .n_raw          = n_raw,
+            .raw_cap        = raw_cap,
+            .raw_start      = raw_start,
+            .n_comp         = n_comp,
+            .window         = window,
+            .ratio          = ratio,
+            .n_head         = n_head,
+            .head_dim       = head_dim,
+            .n_rot          = n_rot,
+            .signs_on       = 1,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_attention_decode_h8_turbo4_pipeline];
+        [enc setBuffer:headsbuf  offset:ds4_gpu_tensor_offset(heads) atIndex:0];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner       atIndex:1];
+        [enc setBuffer:qbuf      offset:ds4_gpu_tensor_offset(q)      atIndex:2];
+        [enc setBuffer:rawbuf    offset:ds4_gpu_tensor_offset(raw_kv_bytes) atIndex:3];
+        [enc setBuffer:compbuf   offset:comp_off atIndex:4];
+        [enc setBuffer:maskbuf   offset:mask_off atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 h8 turbo4 decode attention")) return 0;
+    }
+    return 1;
+}
+
+/* h8 sibling for turbo2 — same shape, env DS4_METAL_TURBO2_H8. */
+struct ds4_metal_args_attn_h8_turbo2 {
+    uint64_t row_bytes;
+    uint32_t use_comp_mask;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    int      signs_on;
+};
+
+int ds4_gpu_attention_decode_h8_turbo2_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_comp_mask,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    static int h8_enable = -1;
+    if (h8_enable < 0) {
+        const char *e = getenv("DS4_METAL_TURBO2_H8");
+        h8_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!h8_enable) return 0;
+    if (!heads || !model_map || !q || !raw_kv_bytes ||
+        head_dim != 512u || n_rot != 64u || n_tokens != 1u ||
+        comp_kv_f16 != 1u || raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_head & 7u) != 0u ||
+        (n_comp != 0u && !comp_kv) ||
+        (use_comp_mask != 0u && !comp_mask)) {
+        return 0;
+    }
+    if (n_raw > 256u) return 0;
+    static int h8_thresh = -1;
+    if (h8_thresh < 0) {
+        const char *e = getenv("DS4_METAL_TURBO2_H8_THRESH");
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
+        if (h8_thresh < 0) h8_thresh = 0;
+    }
+    if ((int)n_raw > h8_thresh) return 0;
+
+    @autoreleasepool {
+        if (sinks_offset > model_size ||
+            (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+            fprintf(stderr, "ds4: Metal h8 turbo2 decode sinks range out of mapped model\n");
+            return 0;
+        }
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                          sinks_offset,
+                                                          (uint64_t)n_head * sizeof(float),
+                                                          &sinks_inner);
+        if (!sinks_buf) return 0;
+
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> qbuf     = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)q);
+        id<MTLBuffer> rawbuf   = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)raw_kv_bytes);
+        id<MTLBuffer> compbuf  = (n_comp != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_kv) : rawbuf;
+        id<MTLBuffer> maskbuf  = (use_comp_mask != 0u) ? ds4_gpu_tensor_buffer((ds4_gpu_tensor *)comp_mask) : rawbuf;
+        NSUInteger comp_off    = (n_comp != 0u) ? ds4_gpu_tensor_offset(comp_kv) : 0;
+        NSUInteger mask_off    = (use_comp_mask != 0u) ? ds4_gpu_tensor_offset(comp_mask) : 0;
+        if (!headsbuf || !qbuf || !rawbuf || !compbuf || !maskbuf) return 0;
+
+        struct ds4_metal_args_attn_h8_turbo2 args = {
+            .row_bytes      = row_bytes,
+            .use_comp_mask  = use_comp_mask,
+            .n_tokens       = n_tokens,
+            .pos0           = pos0,
+            .n_raw          = n_raw,
+            .raw_cap        = raw_cap,
+            .raw_start      = raw_start,
+            .n_comp         = n_comp,
+            .window         = window,
+            .ratio          = ratio,
+            .n_head         = n_head,
+            .head_dim       = head_dim,
+            .n_rot          = n_rot,
+            .signs_on       = 1,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_attention_decode_h8_turbo2_pipeline];
+        [enc setBuffer:headsbuf  offset:ds4_gpu_tensor_offset(heads) atIndex:0];
+        [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner       atIndex:1];
+        [enc setBuffer:qbuf      offset:ds4_gpu_tensor_offset(q)      atIndex:2];
+        [enc setBuffer:rawbuf    offset:ds4_gpu_tensor_offset(raw_kv_bytes) atIndex:3];
+        [enc setBuffer:compbuf   offset:comp_off atIndex:4];
+        [enc setBuffer:maskbuf   offset:mask_off atIndex:5];
+        [enc setBytes:&args length:sizeof(args) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "DSV4 h8 turbo2 decode attention")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_attention_decode_heads_turbo2_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_bytes,
+        uint64_t              row_bytes,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t              use_mask,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot) {
+    return ds4_gpu_attention_decode_mixed_batch_turbo2_heads_tensor(
+            heads, model_map, model_size, sinks_offset,
+            q, raw_kv_bytes, row_bytes,
+            comp_kv, comp_kv_f16,
+            comp_mask, use_mask,
+            /* n_tokens */ 1u,
+            /* pos0    */ 0u,
+            n_raw, raw_cap, raw_start, n_comp,
+            /* window  */ 0u,
+            /* ratio   */ 0u,
+            n_head, head_dim, n_rot);
 }
 
 int ds4_gpu_dsv4_indexer_qat_tensor(

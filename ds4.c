@@ -1737,6 +1737,17 @@ static const float DS4_TURBO4_BOUNDS[15] = {
 };
 #define DS4_TURBO4_MAX 2.7326f
 
+/* Lloyd-Max 4-level codebook for N(0,1).  MSE = 0.117 — opt-in ultra
+ * compression for memory-bound workloads.  Centroids + boundaries
+ * match TURBO2_CODEBOOK / TURBO2_BOUNDS in Atlas's reshape_and_cache_turbo.cu. */
+static const float DS4_TURBO2_CODEBOOK[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f
+};
+static const float DS4_TURBO2_BOUNDS[3] = {
+    -0.9816f, 0.0f, 0.9816f
+};
+#define DS4_TURBO2_MAX 1.5104f
+
 /* FP8 E4M3 max representable.  Matched-norm scale is clamped here so a future
  * Metal storage path can pack the scale into one FP8 byte per 64-element group
  * without an extra renormalization pass. */
@@ -1807,6 +1818,69 @@ static int dsv4_turbo_signs_enabled_cpu(void) {
         cached = (s && s[0] && !(s[0] == '0' && s[1] == 0)) ? 0 : 1;
     }
     return cached;
+}
+
+/* 2-bit quant index: 3 boundaries → idx [0..3]. */
+static int dsv4_turbo2_quantize_index_cpu(float x) {
+    if (x >= DS4_TURBO2_BOUNDS[1]) return (x >= DS4_TURBO2_BOUNDS[2]) ? 3 : 2;
+    return (x >= DS4_TURBO2_BOUNDS[0]) ? 1 : 0;
+}
+
+/* turbo2 sibling of dsv4_turbo3_kv_quantize_row_inplace_cpu. */
+static void dsv4_turbo2_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const int signs_on = dsv4_turbo_signs_enabled_cpu();
+    float buf[64];
+
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] = x[off + i] * DS4_TURBO_SIGNS1_64[i];
+        } else {
+            for (uint32_t i = 0; i < 64; i++) buf[i] = x[off + i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        const float inv_sqrt_n = 1.0f / sqrtf(64.0f);
+        for (uint32_t i = 0; i < 64; i++) buf[i] *= inv_sqrt_n;
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+
+        float amax = 0.0f, norm_sq = 0.0f;
+        for (uint32_t i = 0; i < 64; i++) {
+            const float v = buf[i];
+            const float av = fabsf(v);
+            if (av > amax) amax = av;
+            norm_sq += v * v;
+        }
+        const float k_inv = (amax > 1e-12f) ? (DS4_TURBO2_MAX / amax) : 1.0f;
+
+        int idx[64];
+        float recon_sq = 0.0f;
+        for (uint32_t i = 0; i < 64; i++) {
+            idx[i] = dsv4_turbo2_quantize_index_cpu(buf[i] * k_inv);
+            const float c = DS4_TURBO2_CODEBOOK[idx[i]];
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrtf(recon_sq);
+        float scale = (recon_norm > 1e-10f) ? (sqrtf(norm_sq) / recon_norm) : (amax / DS4_TURBO2_MAX);
+        if (scale > DS4_FP8_E4M3_MAX) scale = DS4_FP8_E4M3_MAX;
+
+        for (uint32_t i = 0; i < 64; i++) {
+            buf[i] = DS4_TURBO2_CODEBOOK[idx[i]] * scale;
+        }
+
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS2_64[i];
+        }
+        dsv4_turbo3_wht64_inplace_cpu(buf);
+        const float inv_sqrt_n2 = 1.0f / sqrtf(64.0f);
+        for (uint32_t i = 0; i < 64; i++) buf[i] *= inv_sqrt_n2;
+        if (signs_on) {
+            for (uint32_t i = 0; i < 64; i++) buf[i] *= DS4_TURBO_SIGNS1_64[i];
+        }
+
+        for (uint32_t i = 0; i < 64; i++) x[off + i] = buf[i];
+    }
 }
 
 /* Linear scan over 15 boundaries → 4-bit idx [0..15].  Same shape as turbo3
@@ -2210,7 +2284,7 @@ static void ds4_kv_set_active_dtype(ds4_kv_dtype dtype) { g_ds4_kv_dtype = dtype
  * specific bit width matters (kernel selection, ppl reference), branch on
  * the dtype directly. */
 static inline int ds4_kv_dtype_is_packed_byte(ds4_kv_dtype d) {
-    return d == DS4_KV_TURBO3 || d == DS4_KV_TURBO4;
+    return d == DS4_KV_TURBO3 || d == DS4_KV_TURBO4 || d == DS4_KV_TURBO2;
 }
 
 /* Dtype-aware in-place round trip on one MLA latent KV row.  Picks the FP8 or
@@ -2220,6 +2294,8 @@ static void ds4_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_
         dsv4_turbo3_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
     } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
         dsv4_turbo4_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
+    } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+        dsv4_turbo2_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
     } else {
         dsv4_fp8_kv_quantize_row_inplace_cpu(x, head_dim, n_rot);
     }
@@ -2244,6 +2320,9 @@ static int ds4_gpu_kv_quantize_tensor_dispatch(
     if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
         return ds4_gpu_dsv4_turbo4_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
     }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+        return ds4_gpu_dsv4_turbo2_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
+    }
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(x, n_tok, head_dim, n_rot);
 }
 
@@ -2263,6 +2342,11 @@ static int ds4_gpu_kv_store_raw_tensor_dispatch(
         return ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
                 kv, raw_cache, raw_cap, row, 1, head_dim, n_rot, row_bytes);
     }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO2);
+        return ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
+                kv, raw_cache, raw_cap, row, 1, head_dim, n_rot, row_bytes);
+    }
     return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, row, head_dim, n_rot);
 }
 
@@ -2280,6 +2364,11 @@ static int ds4_gpu_kv_store_raw_batch_tensor_dispatch(
     if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
         const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO4);
         return ds4_gpu_dsv4_turbo4_kv_pack_batch_tensor(
+                src, raw_cache, raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes);
+    }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO2);
+        return ds4_gpu_dsv4_turbo2_kv_pack_batch_tensor(
                 src, raw_cache, raw_cap, pos0, n_tokens, head_dim, n_rot, row_bytes);
     }
     return ds4_gpu_store_raw_kv_batch_tensor(raw_cache, src, raw_cap, pos0, n_tokens, head_dim);
@@ -2315,6 +2404,15 @@ static ds4_gpu_tensor *ds4_gpu_kv_attention_view_dispatch(
         }
         return scratch;
     }
+    if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+        if (!scratch || !raw_cache) return NULL;
+        const uint64_t row_bytes = ds4_kv_row_bytes(head_dim, n_rot, DS4_KV_TURBO2);
+        if (ds4_gpu_dsv4_turbo2_kv_dequant_to_scratch_tensor(
+                raw_cache, scratch, raw_cap, head_dim, n_rot, row_bytes) == 0) {
+            return NULL;
+        }
+        return scratch;
+    }
     return raw_cache;
 }
 #endif
@@ -2334,10 +2432,16 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
         /* Pathological: no non-RoPE part to compress.  Fall back to floats. */
         return (uint64_t)head_dim * sizeof(float);
     }
-    if (dtype == DS4_KV_TURBO3 || dtype == DS4_KV_TURBO4) {
+    if (dtype == DS4_KV_TURBO3 || dtype == DS4_KV_TURBO4 || dtype == DS4_KV_TURBO2) {
         const uint32_t n_nope = head_dim - n_rot;
         const uint32_t n_groups = (n_nope + DS4_TURBO3_GROUP_SIZE - 1u) / DS4_TURBO3_GROUP_SIZE;
-        const uint64_t bits_per_elem = (dtype == DS4_KV_TURBO4) ? 4u : 3u;
+        uint64_t bits_per_elem;
+        switch (dtype) {
+            case DS4_KV_TURBO4: bits_per_elem = 4u; break;
+            case DS4_KV_TURBO3: bits_per_elem = 3u; break;
+            case DS4_KV_TURBO2: bits_per_elem = 2u; break;
+            default:            bits_per_elem = 3u; break;
+        }
         const uint64_t data_bytes = ((uint64_t)n_nope * bits_per_elem + 7u) / 8u;
         const uint64_t scale_bytes = (uint64_t)n_groups;
         const uint64_t rope_bytes = (uint64_t)n_rot * sizeof(float);
@@ -2350,6 +2454,7 @@ uint64_t ds4_kv_row_bytes(uint32_t head_dim, uint32_t n_rot, ds4_kv_dtype dtype)
  * canonical strings live in one place. */
 const char *ds4_kv_dtype_name(ds4_kv_dtype dtype) {
     switch (dtype) {
+        case DS4_KV_TURBO2: return "turbo2";
         case DS4_KV_TURBO3: return "turbo3";
         case DS4_KV_TURBO4: return "turbo4";
         case DS4_KV_FP8:    return "fp8";
@@ -2362,6 +2467,7 @@ int ds4_kv_dtype_from_name(const char *name, ds4_kv_dtype *out) {
     if (!strcmp(name, "fp8"))    { *out = DS4_KV_FP8;    return 1; }
     if (!strcmp(name, "turbo3")) { *out = DS4_KV_TURBO3; return 1; }
     if (!strcmp(name, "turbo4")) { *out = DS4_KV_TURBO4; return 1; }
+    if (!strcmp(name, "turbo2")) { *out = DS4_KV_TURBO2; return 1; }
     return 0;
 }
 
@@ -10760,17 +10866,26 @@ static bool metal_graph_encode_decode_layer(
              * scratch + fp8 attention) when raw_count exceeds the inline
              * gate (DS4_METAL_TURBO{3,4}_INLINE_THRESH). */
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, g_ds4_kv_dtype);
-            int rc = (g_ds4_kv_dtype == DS4_KV_TURBO3)
-                    ? ds4_gpu_attention_decode_heads_turbo3_tensor(
-                            g->heads, model->map, model->size,
-                            layer->attn_sinks->abs_offset,
-                            g->q, raw_cache, row_bytes, n_raw,
-                            raw_cap, raw_start,
-                            n_comp ? comp_cache : NULL,
-                            metal_graph_attn_comp_cache_is_f16(),
-                            n_comp, NULL, 0,
-                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT)
-                    : ds4_gpu_attention_decode_heads_turbo4_tensor(
+            int rc = 0;
+            if (g_ds4_kv_dtype == DS4_KV_TURBO3) {
+                /* Phase 6: try the h8 head-batched Flash kernel first (env-
+                 * gated, off by default).  Returns 0 if disabled or
+                 * unsupported config -> falls back to Wave M3 launcher. */
+                rc = ds4_gpu_attention_decode_h8_turbo3_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        NULL, 0,
+                        /* n_tokens */ 1u,
+                        /* pos0    */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window  */ 0u,
+                        /* ratio   */ 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo3_tensor(
                             g->heads, model->map, model->size,
                             layer->attn_sinks->abs_offset,
                             g->q, raw_cache, row_bytes, n_raw,
@@ -10779,6 +10894,54 @@ static bool metal_graph_encode_decode_layer(
                             metal_graph_attn_comp_cache_is_f16(),
                             n_comp, NULL, 0,
                             DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
+            } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
+                rc = ds4_gpu_attention_decode_h8_turbo4_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        NULL, 0,
+                        /* n_tokens */ 1u, /* pos0 */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window */ 0u, /* ratio */ 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo4_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
+            } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+                rc = ds4_gpu_attention_decode_h8_turbo2_tensor(
+                        g->heads, model->map, model->size,
+                        layer->attn_sinks->abs_offset,
+                        g->q, raw_cache, row_bytes,
+                        n_comp ? comp_cache : NULL,
+                        metal_graph_attn_comp_cache_is_f16(),
+                        NULL, 0,
+                        /* n_tokens */ 1u, /* pos0 */ 0u,
+                        n_raw, raw_cap, raw_start, n_comp,
+                        /* window */ 0u, /* ratio */ 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                if (rc == 0) {
+                    rc = ds4_gpu_attention_decode_heads_turbo2_tensor(
+                            g->heads, model->map, model->size,
+                            layer->attn_sinks->abs_offset,
+                            g->q, raw_cache, row_bytes, n_raw,
+                            raw_cap, raw_start,
+                            n_comp ? comp_cache : NULL,
+                            metal_graph_attn_comp_cache_is_f16(),
+                            n_comp, NULL, 0,
+                            DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+                }
+            }
             if (rc == 0) {
                 ds4_gpu_tensor *raw_cache_attn = ds4_gpu_kv_attention_view_dispatch(
                         raw_cache, dequant_scratch,
@@ -12643,6 +12806,23 @@ static bool metal_graph_encode_layer_attention_batch(
         } else if (g_ds4_kv_dtype == DS4_KV_TURBO4) {
             const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO4);
             turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo4_heads_tensor(
+                    g->batch_heads,
+                    model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q,
+                    g->layer_raw_cache[il], row_bytes,
+                    /* comp_kv  */ NULL,
+                    /* comp_kv_f16 */ 0,
+                    /* comp_mask */ NULL,
+                    /* use_comp_mask */ 0,
+                    n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                    /* n_comp */ 0,
+                    g->raw_window,
+                    /* ratio */ 0,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT);
+        } else if (g_ds4_kv_dtype == DS4_KV_TURBO2) {
+            const uint64_t row_bytes = ds4_kv_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT, DS4_KV_TURBO2);
+            turbo3_rc = ds4_gpu_attention_decode_mixed_batch_turbo2_heads_tensor(
                     g->batch_heads,
                     model->map, model->size,
                     layer->attn_sinks->abs_offset,
@@ -18717,14 +18897,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->kv_dtype = opt->kv_dtype;
+    /* turbo4 + turbo2 are Metal-only as of Phase 3 — CUDA wrappers
+     * are linker-only stubs.  Reject early with a clear message so the
+     * user picks a supported (backend, dtype) combo instead of silently
+     * falling through to fp8 mid-run.  Phase 4 follow-up will port the
+     * turbo4/turbo2 kernels back to CUDA (atlas branch has the
+     * reference implementations). */
+    if (e->backend == DS4_BACKEND_CUDA &&
+        (e->kv_dtype == DS4_KV_TURBO4 || e->kv_dtype == DS4_KV_TURBO2)) {
+        fprintf(stderr,
+                "ds4: --kv-cache %s is Metal-only in this build; "
+                "use --backend metal or --kv-cache {fp8,turbo3}\n",
+                ds4_kv_dtype_name(e->kv_dtype));
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     ds4_kv_set_active_dtype(e->kv_dtype);
-    /* turbo3 KV on Metal: Phase 2b Wave M0-M2 ships pack/dequant +
-     * float-sim quantize round trip.  The Phase 2b inline-dequant
-     * attention kernels are CUDA-only; on Metal the launchers return 0
-     * and ds4.c's existing fallback paths use view_dispatch (dequant
-     * to scratch) + the stock Metal fp8 attention kernels.  Correct
-     * with full 4.75x memory savings on Metal; inline-dequant perf
-     * parity is future Wave M3+ work. */
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
