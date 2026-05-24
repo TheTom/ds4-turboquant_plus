@@ -2535,6 +2535,17 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
 // (Lloyd-Max codebook + bound table).  See CITATIONS chain in ds4.c near
 // dsv4_turbo3_kv_quantize_row_inplace_cpu for the full attribution.
 
+/* Phase 4.2 forward decls: turbo4/turbo2 dequant primitives are defined
+ * far later in the file (after the turbo3 kernels), but the Phase 4.2
+ * inline-dequant attention kernels appear earlier.  These forward decls
+ * let the compiler see the helper signatures up front. */
+__device__ __forceinline__ void turbo4_dequant_group64_device(
+        float *out64, const unsigned char *row_base,
+        uint32_t group_idx, uint32_t n_nope, int signs_on);
+__device__ __forceinline__ void turbo2_dequant_group64_device(
+        float *out64, const unsigned char *row_base,
+        uint32_t group_idx, uint32_t n_nope, int signs_on);
+
 // Lloyd-Max 8-level codebook for N(0,1).  Byte-equivalent to the CPU table
 // DS4_TURBO3_CODEBOOK in ds4.c.
 __device__ __constant__ float DS4_TURBO3_CODEBOOK_D[8] = {
