@@ -7693,7 +7693,7 @@ int ds4_gpu_attention_decode_h8_turbo3_tensor(
     static int h8_thresh = -1;
     if (h8_thresh < 0) {
         const char *e = getenv("DS4_METAL_TURBO3_H8_THRESH");
-        h8_thresh = (e && e[0]) ? atoi(e) : 96;
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
         if (h8_thresh < 0) h8_thresh = 0;
     }
     if ((int)n_raw > h8_thresh) return 0;
@@ -7819,7 +7819,7 @@ int ds4_gpu_attention_decode_h8_turbo4_tensor(
     static int h8_thresh = -1;
     if (h8_thresh < 0) {
         const char *e = getenv("DS4_METAL_TURBO4_H8_THRESH");
-        h8_thresh = (e && e[0]) ? atoi(e) : 96;
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
         if (h8_thresh < 0) h8_thresh = 0;
     }
     if ((int)n_raw > h8_thresh) return 0;
@@ -7943,7 +7943,7 @@ int ds4_gpu_attention_decode_h8_turbo2_tensor(
     static int h8_thresh = -1;
     if (h8_thresh < 0) {
         const char *e = getenv("DS4_METAL_TURBO2_H8_THRESH");
-        h8_thresh = (e && e[0]) ? atoi(e) : 96;
+        h8_thresh = (e && e[0]) ? atoi(e) : 256;
         if (h8_thresh < 0) h8_thresh = 0;
     }
     if ((int)n_raw > h8_thresh) return 0;

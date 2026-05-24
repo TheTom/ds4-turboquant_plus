@@ -1628,7 +1628,7 @@ kernel void kernel_dsv4_attention_decode_h8_turbo3_f32(
         uint3   tid_v                [[ thread_position_in_threadgroup ]],
         uint3   tpt_v                [[ threads_per_threadgroup ]]) {
     constexpr uint HEADS_PER_TG     = 8u;
-    constexpr uint TILE_C           = 8u;     // rows per K chunk
+    constexpr uint TILE_C           = 16u;
     constexpr uint THREADS_PER_HEAD = 32u;    // = SIMD width, 1 simdgroup per head
     constexpr uint DIMS_PER_THREAD  = 16u;    // 512 / 32 = 16 dims per thread per head
 
@@ -1849,7 +1849,7 @@ kernel void kernel_dsv4_attention_decode_h8_turbo4_f32(
         uint3   tid_v                [[ thread_position_in_threadgroup ]],
         uint3   tpt_v                [[ threads_per_threadgroup ]]) {
     constexpr uint HEADS_PER_TG     = 8u;
-    constexpr uint TILE_C           = 8u;
+    constexpr uint TILE_C           = 16u;
     constexpr uint THREADS_PER_HEAD = 32u;
     constexpr uint DIMS_PER_THREAD  = 16u;
 
@@ -2053,7 +2053,7 @@ kernel void kernel_dsv4_attention_decode_h8_turbo2_f32(
         uint3   tid_v                [[ thread_position_in_threadgroup ]],
         uint3   tpt_v                [[ threads_per_threadgroup ]]) {
     constexpr uint HEADS_PER_TG     = 8u;
-    constexpr uint TILE_C           = 8u;
+    constexpr uint TILE_C           = 16u;
     constexpr uint THREADS_PER_HEAD = 32u;
     constexpr uint DIMS_PER_THREAD  = 16u;
 
